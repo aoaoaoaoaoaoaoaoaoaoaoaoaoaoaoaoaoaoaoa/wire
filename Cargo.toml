@@ -1,0 +1,104 @@
+[workspace]
+members = ["crates/wire"]
+resolver = "3"
+
+[workspace.package]
+categories = ["development-tools"]
+description = "Mattermost chat for Codex agents"
+edition = "2024"
+keywords = ["agents", "coordination", "mcp", "codex"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/wire"
+rust-version = "1.97"
+version = "0.1.0"
+
+[workspace.dependencies]
+clap = { version = "4.5", features = ["derive"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+libmcp = { git = "https://github.com/aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/libmcp.git", rev = "387ae7f2025298d473284872bd201d804755dcd8" }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "multipart", "rustls", "stream"] }
+rmcp = { version = "3.1.4", features = ["server", "macros", "transport-io"] }
+schemars = "1.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "serde"] }
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "process", "rt-multi-thread", "time"] }
+
+[workspace.lints.rust]
+warnings = "deny"
+elided_lifetimes_in_paths = "deny"
+missing_docs = "allow"
+unexpected_cfgs = "deny"
+unsafe_code = "deny"
+unused_crate_dependencies = "deny"
+unused_lifetimes = "deny"
+unused_qualifications = "deny"
+unused_results = "deny"
+
+# House policy: intentional glob vocabularies save tokens; actual ambiguity
+# remains a name-resolution error.
+ambiguous_glob_imports = "allow"
+ambiguous_glob_reexports = "allow"
+hidden_glob_reexports = "allow"
+
+# House policy: Unicode identifier appearance is not a human-legibility gate.
+confusable_idents = "allow"
+mixed_script_confusables = "allow"
+uncommon_codepoints = "allow"
+
+[workspace.lints.rustdoc]
+bare_urls = "deny"
+broken_intra_doc_links = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -2 }
+pedantic = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -3 }
+
+# House policy: line and parameter counts are not complexity measures.
+too_many_arguments = "allow"
+too_many_lines = "allow"
+
+# House policy: lexical appearance is not structural correctness.
+disallowed_names = "allow"
+enum_variant_names = "allow"
+similar_names = "allow"
+struct_field_names = "allow"
+upper_case_acronyms = "allow"
+
+# House policy: source linting cannot adjudicate transitive convergence.
+multiple_crate_versions = "allow"
+
+# Internal tooling does not owe boilerplate API documentation.
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+dbg_macro = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
+allow_attributes_without_reason = "deny"
+
+# House policy: direct and enum-variant glob imports are proper local notation.
+enum_glob_use = "allow"
+wildcard_imports = "allow"
+
+[workspace.metadata.rust-starter]
+format_command = ["cargo", "fmt", "--all", "--check"]
+clippy_command = ["cargo", "clippy", "--workspace", "--all-targets", "--all-features"]
+test_command = ["cargo", "test", "--workspace", "--all-targets", "--all-features"]
+doc_command = ["cargo", "doc", "--workspace", "--all-features", "--no-deps"]
+canonicalize_commands = [
+  ["cargo", "fix", "--workspace", "--all-targets", "--all-features", "--allow-dirty", "--allow-staged", "--allow-no-vcs"],
+  ["cargo", "clippy", "--fix", "--workspace", "--all-targets", "--all-features", "--allow-dirty", "--allow-staged", "--allow-no-vcs"],
+  ["cargo", "fmt", "--all"],
+]
+
+[workspace.metadata.rust-starter.source_files]
+max_lines = 2000
+include = ["*.rs", "**/*.rs"]
+exclude = []

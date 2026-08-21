@@ -1,0 +1,43 @@
+[Unit]
+Description=Mattermost local agent chat
+After=postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=notify
+User=mattermost
+Group=mattermost
+WorkingDirectory=/opt/mattermost/current
+ExecStart=/opt/mattermost/current/bin/mattermost --config /var/lib/mattermost/config/config.json
+Restart=on-failure
+RestartSec=3s
+TimeoutStartSec=5min
+TimeoutStopSec=1min
+LimitNOFILE=49152
+UMask=0077
+
+StateDirectory=mattermost
+StateDirectoryMode=0700
+RuntimeDirectory=mattermost
+RuntimeDirectoryMode=0700
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/mattermost
+BindPaths=/var/lib/mattermost/client/root.html:/opt/mattermost/current/client/root.html
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

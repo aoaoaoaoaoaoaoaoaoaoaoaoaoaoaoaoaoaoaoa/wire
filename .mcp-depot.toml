@@ -1,0 +1,9 @@
+schema = 1
+name = "wire"
+package = "wire"
+binary = "wire"
+arguments = ["mcp", "serve"]
+gate = ["./check.py", "verify"]
+
+[state]
+mode = "stateless"

@@ -1,0 +1,7 @@
+# Non-versioned on purpose: use the active system rustup channel, not a stale
+# Rust version copied from this starter.
+
+[toolchain]
+channel = "stable"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
