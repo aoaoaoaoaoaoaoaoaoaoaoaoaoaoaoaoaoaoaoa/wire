@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 
 use libmcp::{DetailLevel, RenderMode};
 use rmcp::{
@@ -15,11 +15,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use crate::api::{BoundChannel, CreatedPost, DownloadedFile, Mattermost, Timeline, WireError};
+use crate::api::{BoundChannel, CreatedPost, Mattermost, Timeline, WireError};
 
 const DEFAULT_LIMIT: usize = 20;
 const MAX_LIMIT: usize = 100;
-const MAX_ATTACHMENTS: usize = 10;
 const MAX_MESSAGE_CHARS: usize = 16_383;
 const CONCISE_BODY_CHARS: usize = 1_000;
 const FULL_BODY_CHARS: usize = 12_000;
@@ -73,19 +72,6 @@ struct PostArgs {
     #[schemars(description = "Optional thread root post ID.")]
     reply_to: Option<String>,
     #[serde(default)]
-    #[schemars(description = "Absolute local paths to attach. Maximum 10.")]
-    attachments: Vec<PathBuf>,
-    #[serde(default)]
-    render: RenderMode,
-}
-
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct DownloadArgs {
-    file_id: String,
-    #[schemars(description = "Existing absolute directory receiving ID-prefixed file output.")]
-    destination_dir: PathBuf,
-    #[serde(default)]
     render: RenderMode,
 }
 
@@ -105,14 +91,6 @@ struct ChannelsOutput {
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
-struct AttachmentOutput {
-    id: String,
-    name: String,
-    size_bytes: u64,
-    mime_type: String,
-}
-
-#[derive(Clone, Debug, JsonSchema, Serialize)]
 struct MessageOutput {
     id: String,
     created_at: String,
@@ -121,7 +99,6 @@ struct MessageOutput {
     reply_to: Option<String>,
     body: String,
     body_truncated: bool,
-    attachments: Vec<AttachmentOutput>,
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
@@ -134,15 +111,8 @@ struct ReadOutput {
 struct PostOutput {
     channel: String,
     id: String,
+    sender: String,
     reply_to: Option<String>,
-    attachments: Vec<AttachmentOutput>,
-}
-
-#[derive(Clone, Debug, JsonSchema, Serialize)]
-struct DownloadOutput {
-    file: AttachmentOutput,
-    path: PathBuf,
-    bytes_written: u64,
 }
 
 #[tool_router]
@@ -245,7 +215,7 @@ impl WireServer {
 
     #[tool(
         name = "chat.post",
-        description = "Post freeform text and optional local files to a channel or thread.",
+        description = "Post freeform text as this Codex session to a channel or thread.",
         annotations(
             title = "Post chat message",
             read_only_hint = false,
@@ -262,49 +232,10 @@ impl WireServer {
         validate_post(&args)?;
         match self
             .api
-            .post(
-                &args.channel,
-                &args.message,
-                args.reply_to.as_deref(),
-                &args.attachments,
-            )
+            .post(&args.channel, &args.message, args.reply_to.as_deref())
             .await
         {
             Ok(created) => render(PostOutput::from(created), args.render, DetailLevel::Concise),
-            Err(error) => Ok(tool_error(&error)),
-        }
-    }
-
-    #[tool(
-        name = "chat.download",
-        description = "Materialize one attachment into an existing local directory.",
-        annotations(
-            title = "Download chat attachment",
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = true,
-            open_world_hint = false
-        ),
-        output_schema = output_schema::<DownloadOutput>()
-    )]
-    async fn download(
-        &self,
-        Parameters(args): Parameters<DownloadArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        validate_id(&args.file_id, "file_id")?;
-        if !args.destination_dir.is_absolute() {
-            return Err(invalid("destination_dir must be absolute"));
-        }
-        match self
-            .api
-            .download(&args.file_id, &args.destination_dir)
-            .await
-        {
-            Ok(downloaded) => render(
-                DownloadOutput::from(downloaded),
-                args.render,
-                DetailLevel::Concise,
-            ),
             Err(error) => Ok(tool_error(&error)),
         }
     }
@@ -315,7 +246,7 @@ impl ServerHandler for WireServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(
-                "Use chat.channels to discover administrator-created channels. Read with chat.read. Post only useful freeform coordination. Attach local files through chat.post; materialize received files once with chat.download."
+                "Use chat.channels to discover administrator-created channels. Read with chat.read. Post useful freeform coordination with chat.post. Each Codex session has one stable Mattermost bot identity."
             )
             .with_server_info(Implementation::new("wire", env!("CARGO_PKG_VERSION")))
     }
@@ -364,12 +295,6 @@ impl ReadOutput {
                     reply_to: (!post.root_id.is_empty()).then_some(post.root_id),
                     body,
                     body_truncated,
-                    attachments: post
-                        .metadata
-                        .files
-                        .into_iter()
-                        .map(AttachmentOutput::from)
-                        .collect(),
                 }
             })
             .collect();
@@ -380,38 +305,13 @@ impl ReadOutput {
     }
 }
 
-impl From<crate::api::FileInfo> for AttachmentOutput {
-    fn from(value: crate::api::FileInfo) -> Self {
-        Self {
-            id: value.id,
-            name: value.name,
-            size_bytes: value.size,
-            mime_type: value.mime_type,
-        }
-    }
-}
-
 impl From<CreatedPost> for PostOutput {
     fn from(value: CreatedPost) -> Self {
         Self {
             channel: format!("{}:{}", value.channel.team.name, value.channel.channel.name),
             id: value.post.id,
+            sender: value.sender,
             reply_to: (!value.post.root_id.is_empty()).then_some(value.post.root_id),
-            attachments: value
-                .files
-                .into_iter()
-                .map(AttachmentOutput::from)
-                .collect(),
-        }
-    }
-}
-
-impl From<DownloadedFile> for DownloadOutput {
-    fn from(value: DownloadedFile) -> Self {
-        Self {
-            file: AttachmentOutput::from(value.info),
-            path: value.path,
-            bytes_written: value.bytes,
         }
     }
 }
@@ -444,12 +344,8 @@ impl Porcelain for ReadOutput {
         for message in &self.messages {
             let reply = message.reply_to.as_deref().unwrap_or("-");
             lines.push(format!(
-                "{} | {} | @{} | reply={} | files={}",
-                message.created_at,
-                message.id,
-                message.sender,
-                reply,
-                message.attachments.len()
+                "{} | {} | @{} | reply={}",
+                message.created_at, message.id, message.sender, reply
             ));
             let body = match detail {
                 DetailLevel::Concise => collapse(&message.body),
@@ -463,12 +359,6 @@ impl Porcelain for ReadOutput {
                     ""
                 }
             ));
-            lines.extend(message.attachments.iter().map(|file| {
-                format!(
-                    "  file {} | {} | {} bytes | {}",
-                    file.id, file.name, file.size_bytes, file.mime_type
-                )
-            }));
         }
         lines.join("\n")
     }
@@ -476,23 +366,7 @@ impl Porcelain for ReadOutput {
 
 impl Porcelain for PostOutput {
     fn porcelain(&self, _detail: DetailLevel) -> String {
-        format!(
-            "posted {} | {} | files={}",
-            self.id,
-            self.channel,
-            self.attachments.len()
-        )
-    }
-}
-
-impl Porcelain for DownloadOutput {
-    fn porcelain(&self, _detail: DetailLevel) -> String {
-        format!(
-            "downloaded {} | {} bytes | {}",
-            self.file.id,
-            self.bytes_written,
-            self.path.display()
-        )
+        format!("posted {} | {} | @{}", self.id, self.channel, self.sender)
     }
 }
 
@@ -527,8 +401,8 @@ fn validate_limit(limit: usize) -> Result<(), McpError> {
 }
 
 fn validate_post(args: &PostArgs) -> Result<(), McpError> {
-    if args.message.is_empty() && args.attachments.is_empty() {
-        return Err(invalid("message or attachments must be present"));
+    if args.message.is_empty() {
+        return Err(invalid("message must be present"));
     }
     if args.message.chars().count() > MAX_MESSAGE_CHARS {
         return Err(invalid(format!(
@@ -536,25 +410,6 @@ fn validate_post(args: &PostArgs) -> Result<(), McpError> {
         )));
     }
     validate_optional_id(args.reply_to.as_deref(), "reply_to")?;
-    if args.attachments.len() > MAX_ATTACHMENTS {
-        return Err(invalid(format!(
-            "attachments may contain at most {MAX_ATTACHMENTS} paths"
-        )));
-    }
-    for path in &args.attachments {
-        if !path.is_absolute() {
-            return Err(invalid(format!(
-                "attachment path must be absolute: {}",
-                path.display()
-            )));
-        }
-        if !path.is_file() {
-            return Err(invalid(format!(
-                "attachment is not a regular file: {}",
-                path.display()
-            )));
-        }
-    }
     Ok(())
 }
 

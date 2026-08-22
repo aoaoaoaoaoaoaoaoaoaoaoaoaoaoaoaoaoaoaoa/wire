@@ -140,14 +140,6 @@ api_post() {
 }
 
 readonly main_id=$(api_get /users/username/main | jq -er .id)
-if ! api_get /users/username/codex >/dev/null 2>&1; then
-    jq -cn '{
-        username: "codex",
-        display_name: "Codex",
-        description: "Local agent chat identity"
-    }' | api_post /bots >/dev/null
-fi
-readonly bot_id=$(api_get /users/username/codex | jq -er .id)
 readonly team_id=$(api_get /teams/name/eternalist | jq -er .id)
 readonly channel_id=$(api_get "/teams/$team_id/channels/name/agents" | jq -er .id)
 
@@ -156,37 +148,27 @@ if ! api_get "/teams/$team_id/members/$main_id" >/dev/null 2>&1; then
         '{team_id: $team_id, user_id: $user_id}' | \
         api_post "/teams/$team_id/members" >/dev/null
 fi
-if ! api_get "/teams/$team_id/members/$bot_id" >/dev/null 2>&1; then
-    jq -cn --arg team_id "$team_id" --arg user_id "$bot_id" \
-        '{team_id: $team_id, user_id: $user_id}' | \
-        api_post "/teams/$team_id/members" >/dev/null
-fi
 if ! api_get "/channels/$channel_id/members/$main_id" >/dev/null 2>&1; then
     jq -cn --arg channel_id "$channel_id" --arg user_id "$main_id" \
         '{channel_id: $channel_id, user_id: $user_id}' | \
         api_post "/channels/$channel_id/members" >/dev/null
 fi
-if ! api_get "/channels/$channel_id/members/$bot_id" >/dev/null 2>&1; then
-    jq -cn --arg channel_id "$channel_id" --arg user_id "$bot_id" \
-        '{channel_id: $channel_id, user_id: $user_id}' | \
-        api_post "/channels/$channel_id/members" >/dev/null
-fi
 
 if ! secret_lookup \
-    application wire service mattermost account codex >/dev/null; then
-    token_json=$(jq -cn '{description: "wire-mcp"}' | \
-        api_post "/users/$bot_id/tokens")
+    application wire service mattermost account admin >/dev/null; then
+    token_json=$(jq -cn '{description: "wire administrator"}' | \
+        api_post "/users/$main_id/tokens")
     readonly token_json
     token=$(jq -er 'first(.. | objects | .token? // empty)' <<<"$token_json")
     readonly token
     [[ -n $token ]] || {
-        printf 'mmctl returned no agent token\n' >&2
+        printf 'Mattermost returned no administrator token\n' >&2
         exit 1
     }
     secret_store \
-        'Wire Mattermost agent token' \
+        'Wire Mattermost administrator token' \
         "$token" \
-        application wire service mattermost account codex
+        application wire service mattermost account admin
 fi
 
 curl --fail --silent --show-error --output /dev/null \

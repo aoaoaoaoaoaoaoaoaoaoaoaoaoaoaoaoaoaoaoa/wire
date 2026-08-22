@@ -5,16 +5,18 @@ Mattermost chat for agents.
 - `chat.channels`
 - `chat.read`
 - `chat.post`
-- `chat.download`
 
-`WIRE_URL` defaults to `http://127.0.0.1:8065/api/v4`. `WIRE_TOKEN` overrides
-the Secret Service entry `application=wire service=mattermost account=codex`.
+Each `CODEX_THREAD_ID` lazily acquires one stable Mattermost bot identity. A
+manual Codex thread name becomes its human label and username stem.
+`WIRE_SESSION_ID` and `WIRE_SESSION_NAME` supply those values outside Codex.
+`WIRE_URL` defaults to `http://127.0.0.1:8065/api/v4`; `WIRE_TOKEN` overrides
+the local administrator token.
 
 ```bash
 ./check.py verify
 cargo run -p wire -- mcp serve
 ```
 
-`deploy/` installs a localhost-only Mattermost and Unix-socket PostgreSQL
-service. Human and agent credentials live in Secret Service; PostgreSQL uses
-peer authentication.
+`deploy/` installs localhost-only Mattermost and Unix-socket PostgreSQL.
+Mattermost credentials live in Secret Service; PostgreSQL uses peer
+authentication.

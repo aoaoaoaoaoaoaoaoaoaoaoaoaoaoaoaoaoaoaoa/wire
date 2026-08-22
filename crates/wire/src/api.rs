@@ -2,26 +2,35 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     ffi::OsString,
-    path::{Path, PathBuf},
-    process::Command,
+    fs,
+    path::PathBuf,
+    process::{Command as StdCommand, Stdio},
+    sync::Arc,
     time::Duration,
 };
 
-use futures_util::StreamExt;
-use reqwest::{Client, RequestBuilder, StatusCode, multipart};
+use reqwest::{Client, RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tempfile::NamedTempFile;
 use thiserror::Error;
-use tokio::io::AsyncWriteExt;
+use tokio::{
+    io::AsyncWriteExt,
+    process::Command,
+    sync::{Mutex, OnceCell},
+};
+use uuid::Uuid;
 
 const DEFAULT_URL: &str = "http://127.0.0.1:8065/api/v4";
 const ERROR_BODY_LIMIT: usize = 2_000;
+const ADMIN_ACCOUNT: &str = "admin";
+const SESSION_ACCOUNT: &str = "session";
 
 #[derive(Clone)]
 pub(crate) struct Mattermost {
     base: String,
     client: Client,
-    token: String,
+    admin_token: String,
+    session: Option<Session>,
+    identity: Arc<OnceCell<Identity>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -57,14 +66,6 @@ pub(crate) struct BoundChannel {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct FileInfo {
-    pub(crate) id: String,
-    pub(crate) name: String,
-    pub(crate) size: u64,
-    pub(crate) mime_type: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct Post {
     pub(crate) id: String,
     pub(crate) create_at: i64,
@@ -73,16 +74,6 @@ pub(crate) struct Post {
     pub(crate) channel_id: String,
     pub(crate) root_id: String,
     pub(crate) message: String,
-    #[serde(default)]
-    pub(crate) file_ids: Vec<String>,
-    #[serde(default)]
-    pub(crate) metadata: PostMetadata,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub(crate) struct PostMetadata {
-    #[serde(default)]
-    pub(crate) files: Vec<FileInfo>,
 }
 
 #[derive(Clone, Debug)]
@@ -96,25 +87,53 @@ pub(crate) struct Timeline {
 pub(crate) struct CreatedPost {
     pub(crate) channel: BoundChannel,
     pub(crate) post: Post,
-    pub(crate) files: Vec<FileInfo>,
+    pub(crate) sender: String,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct DownloadedFile {
-    pub(crate) info: FileInfo,
-    pub(crate) path: PathBuf,
-    pub(crate) bytes: u64,
+struct Session {
+    id: Uuid,
+    title: Option<String>,
+}
+
+#[derive(Debug)]
+struct Identity {
+    user_id: String,
+    token: String,
+    profile: Mutex<Profile>,
+    channels: Mutex<HashSet<String>>,
+}
+
+#[derive(Clone, Debug)]
+struct Profile {
+    title: Option<String>,
+    username: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct Bot {
+    user_id: String,
+    username: String,
+    display_name: String,
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionIndexRow {
+    id: Uuid,
+    thread_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AccessToken {
+    id: String,
+    token: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct PostList {
     order: Vec<String>,
     posts: HashMap<String, Post>,
-}
-
-#[derive(Debug, Deserialize)]
-struct UploadResponse {
-    file_infos: Vec<FileInfo>,
 }
 
 #[derive(Debug, Error)]
@@ -129,10 +148,66 @@ pub(crate) enum WireError {
     Response { status: StatusCode, body: String },
     #[error("Mattermost response was invalid: {0}")]
     Decode(#[from] serde_json::Error),
-    #[error("local file operation failed: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("keyring lookup failed: {0}")]
+    #[error("local credential registry failed: {0}")]
     Keyring(String),
+}
+
+impl Session {
+    fn load() -> Result<Option<Self>, WireError> {
+        let raw = ["CODEX_THREAD_ID", "WIRE_SESSION_ID"]
+            .into_iter()
+            .find_map(|name| env::var(name).ok().filter(|value| !value.trim().is_empty()));
+        raw.map(|raw| {
+            let id = Uuid::parse_str(raw.trim()).map_err(|error| {
+                WireError::Configuration(format!("session identity is not a UUID: {error}"))
+            })?;
+            let title = ["CODEX_THREAD_NAME", "WIRE_SESSION_NAME"]
+                .into_iter()
+                .find_map(|name| env::var(name).ok().filter(|value| !value.trim().is_empty()))
+                .or_else(|| indexed_title(id));
+            Ok(Self { id, title })
+        })
+        .transpose()
+    }
+
+    fn description(&self) -> String {
+        format!("Codex session {}", self.id)
+    }
+
+    fn display_name(&self) -> String {
+        let compact = self.id.simple().to_string();
+        self.title.as_ref().map_or_else(
+            || format!("Codex {}", &compact[..8]),
+            |title| {
+                let title = truncate_chars(title.trim(), 55);
+                format!("{title} · {}", &compact[..4])
+            },
+        )
+    }
+
+    fn username_candidates(&self) -> Vec<String> {
+        let compact = self.id.simple().to_string();
+        let mut candidates = self.title.as_deref().map_or_else(Vec::new, |title| {
+            let slug = session_slug(title);
+            if slug.is_empty() {
+                Vec::new()
+            } else {
+                vec![
+                    format!("codex-{}", truncate_chars(&slug, 16)),
+                    format!("codex-{}-{}", truncate_chars(&slug, 11), &compact[..4]),
+                    format!("codex-{}-{}", truncate_chars(&slug, 7), &compact[..8]),
+                ]
+            }
+        });
+        candidates.push(self.legacy_username());
+        candidates.dedup();
+        candidates
+    }
+
+    fn legacy_username(&self) -> String {
+        let compact = self.id.simple().to_string();
+        format!("codex-{}", &compact[..16])
+    }
 }
 
 impl Mattermost {
@@ -152,10 +227,17 @@ impl Mattermost {
                     .to_owned(),
             ));
         }
-        let token = env::var("WIRE_TOKEN")
+        let admin_token = env::var("WIRE_TOKEN")
             .ok()
             .filter(|value| !value.trim().is_empty())
-            .map_or_else(load_keyring_token, Ok)?;
+            .map_or_else(
+                || {
+                    lookup_secret_sync(ADMIN_ACCOUNT, None)?.ok_or_else(|| {
+                        WireError::Keyring("Mattermost administrator token is absent".to_owned())
+                    })
+                },
+                Ok,
+            )?;
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_mins(5))
@@ -164,7 +246,9 @@ impl Mattermost {
         Ok(Self {
             base: base.trim_end_matches('/').to_owned(),
             client,
-            token,
+            admin_token,
+            session: Session::load()?,
+            identity: Arc::new(OnceCell::new()),
         })
     }
 
@@ -219,7 +303,9 @@ impl Mattermost {
             channel_matches && team_matches
         });
         let first = matches.next().ok_or_else(|| {
-            WireError::Input(format!("channel `{selector}` is not visible to the agent"))
+            WireError::Input(format!(
+                "channel `{selector}` is not visible to the administrator"
+            ))
         })?;
         if matches.next().is_some() {
             return Err(WireError::Input(format!(
@@ -252,7 +338,7 @@ impl Mattermost {
             .into_iter()
             .filter_map(|id| list.posts.get(&id).cloned())
             .collect::<Vec<_>>();
-        posts.reverse();
+        posts.sort_by_key(|post| post.create_at);
         let user_ids = posts
             .iter()
             .map(|post| post.user_id.clone())
@@ -280,116 +366,299 @@ impl Mattermost {
         selector: &str,
         message: &str,
         reply_to: Option<&str>,
-        attachments: &[PathBuf],
     ) -> Result<CreatedPost, WireError> {
         let channel = self.resolve_channel(selector).await?;
-        let files = if attachments.is_empty() {
-            Vec::new()
-        } else {
-            self.upload(&channel.channel.id, attachments).await?
-        };
+        let identity = self.identity().await?;
+        let sender = self.sync_profile(identity).await?;
+        self.ensure_membership(identity, &channel).await?;
         let post = self
-            .post_json(
+            .post_json_as(
+                &identity.token,
                 "/posts",
                 &serde_json::json!({
                     "channel_id": channel.channel.id,
                     "message": message,
                     "root_id": reply_to.unwrap_or_default(),
-                    "file_ids": files.iter().map(|file| &file.id).collect::<Vec<_>>(),
                 }),
             )
             .await?;
         Ok(CreatedPost {
             channel,
             post,
-            files,
+            sender,
         })
     }
 
-    pub(crate) async fn download(
-        &self,
-        file_id: &str,
-        destination_dir: &Path,
-    ) -> Result<DownloadedFile, WireError> {
-        let info: FileInfo = self.get(&format!("/files/{file_id}/info")).await?;
-        let directory = destination_dir.canonicalize()?;
-        if !directory.is_dir() {
-            return Err(WireError::Input(format!(
-                "destination is not a directory: {}",
-                directory.display()
-            )));
-        }
-        let name = Path::new(&info.name)
-            .file_name()
-            .and_then(|value| value.to_str())
-            .filter(|value| !value.is_empty())
-            .unwrap_or("attachment");
-        let destination = directory.join(format!("{}-{name}", info.id));
-        let response = self
-            .checked(self.request(reqwest::Method::GET, &format!("/files/{file_id}")))
-            .await?;
-        let temporary = NamedTempFile::new_in(&directory)?;
-        let clone = temporary.as_file().try_clone()?;
-        let mut output = tokio::fs::File::from_std(clone);
-        let mut stream = response.bytes_stream();
-        let mut bytes = 0_u64;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            output.write_all(&chunk).await?;
-            bytes = bytes
-                .checked_add(
-                    u64::try_from(chunk.len())
-                        .map_err(|_| WireError::Input("attachment size exceeds u64".to_owned()))?,
-                )
-                .ok_or_else(|| WireError::Input("attachment size exceeds u64".to_owned()))?;
-        }
-        output.flush().await?;
-        drop(output);
-        if bytes != info.size {
-            return Err(WireError::Response {
-                status: StatusCode::OK,
-                body: format!(
-                    "attachment length mismatch: expected {}, received {bytes}",
-                    info.size
-                ),
-            });
-        }
-        let _file = temporary
-            .persist(&destination)
-            .map_err(|error| error.error)?;
-        Ok(DownloadedFile {
-            info,
-            path: destination,
-            bytes,
+    async fn identity(&self) -> Result<&Identity, WireError> {
+        self.identity
+            .get_or_try_init(|| async {
+                let session = self.current_session()?;
+                let bot = self.ensure_bot(session).await?;
+                let token = self.identity_token(session, &bot).await?;
+                Ok(Identity {
+                    user_id: bot.user_id,
+                    token,
+                    profile: Mutex::new(Profile {
+                        title: session.title.clone(),
+                        username: bot.username,
+                    }),
+                    channels: Mutex::new(HashSet::new()),
+                })
+            })
+            .await
+    }
+
+    fn current_session(&self) -> Result<&Session, WireError> {
+        self.session.as_ref().ok_or_else(|| {
+            WireError::Configuration(
+                "chat.post requires CODEX_THREAD_ID or WIRE_SESSION_ID".to_owned(),
+            )
         })
     }
 
-    async fn upload(
-        &self,
-        channel_id: &str,
-        attachments: &[PathBuf],
-    ) -> Result<Vec<FileInfo>, WireError> {
-        let mut form = multipart::Form::new().text("channel_id", channel_id.to_owned());
-        for path in attachments {
-            form = form.file("files", path).await?;
+    async fn sync_profile(&self, identity: &Identity) -> Result<String, WireError> {
+        let Some(session) = Session::load()? else {
+            return Err(WireError::Configuration(
+                "chat.post requires CODEX_THREAD_ID or WIRE_SESSION_ID".to_owned(),
+            ));
+        };
+        if session.id != self.current_session()?.id {
+            return Err(WireError::Configuration(
+                "session identity changed after Wire started".to_owned(),
+            ));
         }
-        let response: UploadResponse = self
-            .decode(
-                self.checked(
-                    self.request(reqwest::Method::POST, "/files")
-                        .multipart(form),
+        let mut profile = identity.profile.lock().await;
+        if profile.title == session.title {
+            return Ok(profile.username.clone());
+        }
+        let bot: Bot = self.get(&format!("/bots/{}", identity.user_id)).await?;
+        let bot = self.sync_bot_profile(&session, bot).await?;
+        *profile = Profile {
+            title: session.title,
+            username: bot.username.clone(),
+        };
+        Ok(bot.username)
+    }
+
+    async fn ensure_bot(&self, session: &Session) -> Result<Bot, WireError> {
+        if let Some(bot) = self.find_bot(session).await? {
+            return self.sync_bot_profile(session, bot).await;
+        }
+        for username in session.username_candidates() {
+            if !self.username_available(&username, None).await? {
+                continue;
+            }
+            let created = self
+                .post_json(
+                    "/bots",
+                    &serde_json::json!({
+                        "username": username,
+                        "display_name": session.display_name(),
+                        "description": session.description(),
+                    }),
                 )
-                .await?,
+                .await;
+            match created {
+                Ok(bot) => return Ok(bot),
+                Err(WireError::Response {
+                    status: StatusCode::BAD_REQUEST,
+                    ..
+                }) => {
+                    if let Some(bot) = self.find_bot(session).await? {
+                        return self.sync_bot_profile(session, bot).await;
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(WireError::Configuration(
+            "no available Mattermost username for this session".to_owned(),
+        ))
+    }
+
+    async fn find_bot(&self, session: &Session) -> Result<Option<Bot>, WireError> {
+        let description = session.description();
+        for page in 0.. {
+            let bots: Vec<Bot> = self.get(&format!("/bots?page={page}&per_page=200")).await?;
+            let count = bots.len();
+            if let Some(bot) = bots
+                .into_iter()
+                .find(|bot| bot.description.as_deref() == Some(description.as_str()))
+            {
+                return Ok(Some(bot));
+            }
+            if count < 200 {
+                return Ok(None);
+            }
+        }
+        unreachable!()
+    }
+
+    async fn sync_bot_profile(&self, session: &Session, bot: Bot) -> Result<Bot, WireError> {
+        let display_name = session.display_name();
+        if bot.display_name == display_name {
+            return Ok(bot);
+        }
+        let mut username = None;
+        for candidate in session.username_candidates() {
+            if self
+                .username_available(&candidate, Some(&bot.user_id))
+                .await?
+            {
+                username = Some(candidate);
+                break;
+            }
+        }
+        let username = username.ok_or_else(|| {
+            WireError::Configuration("no available Mattermost username for this session".to_owned())
+        })?;
+        self.put_json(
+            &format!("/bots/{}", bot.user_id),
+            &serde_json::json!({
+                "username": username,
+                "display_name": display_name,
+                "description": session.description(),
+            }),
+        )
+        .await
+    }
+
+    async fn username_available(
+        &self,
+        username: &str,
+        bot_user_id: Option<&str>,
+    ) -> Result<bool, WireError> {
+        Ok(self
+            .get_optional::<User>(&format!("/users/username/{username}"))
+            .await?
+            .is_none_or(|user| bot_user_id == Some(user.id.as_str())))
+    }
+
+    async fn identity_token(&self, session: &Session, bot: &Bot) -> Result<String, WireError> {
+        if let Some(token) = lookup_secret(SESSION_ACCOUNT, Some(session.id)).await?
+            && self.token_belongs_to(&token, &bot.user_id).await?
+        {
+            return Ok(token);
+        }
+        for account in session.username_candidates() {
+            if let Some(token) = lookup_secret(&account, Some(session.id)).await?
+                && self.token_belongs_to(&token, &bot.user_id).await?
+            {
+                store_secret(SESSION_ACCOUNT, session.id, &session.display_name(), &token).await?;
+                let _cleared = clear_secret(&account, session.id).await;
+                return Ok(token);
+            }
+        }
+        self.mint_token(session, &bot.user_id).await
+    }
+
+    async fn token_belongs_to(&self, token: &str, user_id: &str) -> Result<bool, WireError> {
+        match self.get_as::<User>(token, "/users/me").await {
+            Ok(user) => Ok(user.id == user_id),
+            Err(WireError::Response {
+                status: StatusCode::UNAUTHORIZED,
+                ..
+            }) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn mint_token(&self, session: &Session, user_id: &str) -> Result<String, WireError> {
+        let access: AccessToken = self
+            .post_json(
+                &format!("/users/{user_id}/tokens"),
+                &serde_json::json!({"description": format!("wire {}", session.id)}),
             )
             .await?;
-        Ok(response.file_infos)
+        if let Err(error) = store_secret(
+            SESSION_ACCOUNT,
+            session.id,
+            &session.display_name(),
+            &access.token,
+        )
+        .await
+        {
+            let _revoked: Result<serde_json::Value, WireError> = self
+                .post_json(
+                    "/users/tokens/revoke",
+                    &serde_json::json!({"token_id": access.id}),
+                )
+                .await;
+            return Err(error);
+        }
+        Ok(access.token)
+    }
+
+    async fn ensure_membership(
+        &self,
+        identity: &Identity,
+        channel: &BoundChannel,
+    ) -> Result<(), WireError> {
+        let mut channels = identity.channels.lock().await;
+        if channels.contains(&channel.channel.id) {
+            return Ok(());
+        }
+        let team_member = format!("/teams/{}/members/{}", channel.team.id, identity.user_id);
+        if self
+            .get_optional::<serde_json::Value>(&team_member)
+            .await?
+            .is_none()
+        {
+            let _: serde_json::Value = self
+                .post_json(
+                    &format!("/teams/{}/members", channel.team.id),
+                    &serde_json::json!({
+                        "team_id": channel.team.id,
+                        "user_id": identity.user_id,
+                    }),
+                )
+                .await?;
+        }
+        let channel_member = format!(
+            "/channels/{}/members/{}",
+            channel.channel.id, identity.user_id
+        );
+        if self
+            .get_optional::<serde_json::Value>(&channel_member)
+            .await?
+            .is_none()
+        {
+            let _: serde_json::Value = self
+                .post_json(
+                    &format!("/channels/{}/members", channel.channel.id),
+                    &serde_json::json!({
+                        "channel_id": channel.channel.id,
+                        "user_id": identity.user_id,
+                    }),
+                )
+                .await?;
+        }
+        let _inserted = channels.insert(channel.channel.id.clone());
+        Ok(())
     }
 
     async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, WireError> {
+        self.get_as(&self.admin_token, path).await
+    }
+
+    async fn get_as<T: DeserializeOwned>(&self, token: &str, path: &str) -> Result<T, WireError> {
         let response = self
-            .checked(self.request(reqwest::Method::GET, path))
+            .checked(self.request_as(token, reqwest::Method::GET, path))
             .await?;
         self.decode(response).await
+    }
+
+    async fn get_optional<T: DeserializeOwned>(&self, path: &str) -> Result<Option<T>, WireError> {
+        let response = self
+            .request_as(&self.admin_token, reqwest::Method::GET, path)
+            .send()
+            .await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        self.decode(self.checked_response(response).await?)
+            .await
+            .map(Some)
     }
 
     async fn post_json<I: Serialize + ?Sized, O: DeserializeOwned>(
@@ -397,20 +666,52 @@ impl Mattermost {
         path: &str,
         input: &I,
     ) -> Result<O, WireError> {
+        self.post_json_as(&self.admin_token, path, input).await
+    }
+
+    async fn put_json<I: Serialize + ?Sized, O: DeserializeOwned>(
+        &self,
+        path: &str,
+        input: &I,
+    ) -> Result<O, WireError> {
         let response = self
-            .checked(self.request(reqwest::Method::POST, path).json(input))
+            .checked(
+                self.request_as(&self.admin_token, reqwest::Method::PUT, path)
+                    .json(input),
+            )
             .await?;
         self.decode(response).await
     }
 
-    fn request(&self, method: reqwest::Method, path: &str) -> RequestBuilder {
+    async fn post_json_as<I: Serialize + ?Sized, O: DeserializeOwned>(
+        &self,
+        token: &str,
+        path: &str,
+        input: &I,
+    ) -> Result<O, WireError> {
+        let response = self
+            .checked(
+                self.request_as(token, reqwest::Method::POST, path)
+                    .json(input),
+            )
+            .await?;
+        self.decode(response).await
+    }
+
+    fn request_as(&self, token: &str, method: reqwest::Method, path: &str) -> RequestBuilder {
         self.client
             .request(method, format!("{}{path}", self.base))
-            .bearer_auth(&self.token)
+            .bearer_auth(token)
     }
 
     async fn checked(&self, request: RequestBuilder) -> Result<reqwest::Response, WireError> {
-        let response = request.send().await?;
+        self.checked_response(request.send().await?).await
+    }
+
+    async fn checked_response(
+        &self,
+        response: reqwest::Response,
+    ) -> Result<reqwest::Response, WireError> {
         let status = response.status();
         if status.is_success() {
             return Ok(response);
@@ -429,20 +730,108 @@ impl Mattermost {
     }
 }
 
-fn load_keyring_token() -> Result<String, WireError> {
-    let output = Command::new("secret-tool")
-        .args([
-            OsString::from("lookup"),
-            OsString::from("application"),
-            OsString::from("wire"),
-            OsString::from("service"),
-            OsString::from("mattermost"),
-            OsString::from("account"),
-            OsString::from("codex"),
-        ])
+fn lookup_secret_sync(account: &str, session: Option<Uuid>) -> Result<Option<String>, WireError> {
+    let output = StdCommand::new("secret-tool")
+        .args(secret_args("lookup", account, session))
         .output()
         .map_err(|error| WireError::Keyring(error.to_string()))?;
+    secret_output(output)
+}
+
+async fn lookup_secret(account: &str, session: Option<Uuid>) -> Result<Option<String>, WireError> {
+    let output = Command::new("secret-tool")
+        .args(secret_args("lookup", account, session))
+        .output()
+        .await
+        .map_err(|error| WireError::Keyring(error.to_string()))?;
+    secret_output(output)
+}
+
+async fn clear_secret(account: &str, session: Uuid) -> Result<bool, WireError> {
+    let output = Command::new("secret-tool")
+        .args(secret_args("clear", account, Some(session)))
+        .output()
+        .await
+        .map_err(|error| WireError::Keyring(error.to_string()))?;
+    if output.status.success() {
+        Ok(true)
+    } else if output.status.code() == Some(1) && output.stderr.is_empty() {
+        Ok(false)
+    } else {
+        Err(WireError::Keyring(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ))
+    }
+}
+
+async fn store_secret(
+    account: &str,
+    session: Uuid,
+    display_name: &str,
+    token: &str,
+) -> Result<(), WireError> {
+    let mut child = Command::new("secret-tool")
+        .args([
+            OsString::from("store"),
+            OsString::from(format!("--label=Wire {display_name}")),
+        ])
+        .args(secret_attributes(account, Some(session)))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| WireError::Keyring(error.to_string()))?;
+    let mut input = child
+        .stdin
+        .take()
+        .ok_or_else(|| WireError::Keyring("secret-tool stdin is unavailable".to_owned()))?;
+    input
+        .write_all(token.as_bytes())
+        .await
+        .map_err(|error| WireError::Keyring(error.to_string()))?;
+    drop(input);
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|error| WireError::Keyring(error.to_string()))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(WireError::Keyring(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ))
+    }
+}
+
+fn secret_args(command: &str, account: &str, session: Option<Uuid>) -> Vec<OsString> {
+    let mut args = vec![OsString::from(command)];
+    args.extend(secret_attributes(account, session));
+    args
+}
+
+fn secret_attributes(account: &str, session: Option<Uuid>) -> Vec<OsString> {
+    let mut attributes = vec![
+        OsString::from("application"),
+        OsString::from("wire"),
+        OsString::from("service"),
+        OsString::from("mattermost"),
+        OsString::from("account"),
+        OsString::from(account),
+    ];
+    if let Some(session) = session {
+        attributes.extend([
+            OsString::from("session"),
+            OsString::from(session.to_string()),
+        ]);
+    }
+    attributes
+}
+
+fn secret_output(output: std::process::Output) -> Result<Option<String>, WireError> {
     if !output.status.success() {
+        if output.status.code() == Some(1) && output.stderr.is_empty() {
+            return Ok(None);
+        }
         return Err(WireError::Keyring(
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         ));
@@ -451,10 +840,54 @@ fn load_keyring_token() -> Result<String, WireError> {
         .map_err(|error| WireError::Keyring(error.to_string()))?
         .trim()
         .to_owned();
-    if token.is_empty() {
-        return Err(WireError::Keyring("token is empty".to_owned()));
+    Ok((!token.is_empty()).then_some(token))
+}
+
+fn indexed_title(id: Uuid) -> Option<String> {
+    let path = env::var_os("CODEX_HOME").map_or_else(
+        || {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".codex"))
+                .unwrap_or_default()
+        },
+        PathBuf::from,
+    );
+    fs::read_to_string(path.join("session_index.jsonl"))
+        .ok()?
+        .lines()
+        .filter_map(|line| serde_json::from_str::<SessionIndexRow>(line).ok())
+        .filter(|row| row.id == id && !row.thread_name.trim().is_empty())
+        .map(|row| row.thread_name)
+        .next_back()
+}
+
+fn session_slug(title: &str) -> String {
+    let title = title.trim();
+    let folded = title.to_ascii_lowercase();
+    let title = ["coder_", "coder-", "codex_", "codex-"]
+        .into_iter()
+        .find_map(|prefix| folded.starts_with(prefix).then(|| &title[prefix.len()..]))
+        .unwrap_or(title);
+    let mut slug = String::new();
+    let mut separated = false;
+    for character in title.chars() {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character.to_ascii_lowercase());
+            separated = false;
+        } else if !slug.is_empty() && !separated {
+            slug.push('-');
+            separated = true;
+        }
     }
-    Ok(token)
+    if separated {
+        let _last = slug.pop();
+    }
+    slug
+}
+
+fn truncate_chars(value: &str, limit: usize) -> String {
+    value.chars().take(limit).collect()
 }
 
 fn name_matches(selector: &str, name: &str, display_name: &str) -> bool {
