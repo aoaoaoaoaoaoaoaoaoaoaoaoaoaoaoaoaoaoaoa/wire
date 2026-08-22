@@ -5,7 +5,8 @@ use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
     model::{
-        CallToolResult, ContentBlock, Implementation, MetaObject, ServerCapabilities, ServerInfo,
+        CallToolResult, ContentBlock, Implementation, MetaObject, RequestMetaObject,
+        ServerCapabilities, ServerInfo,
     },
     tool, tool_handler, tool_router,
     transport::stdio,
@@ -17,7 +18,8 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 use crate::api::{
-    BoundChannel, CreatedDirectMessage, CreatedPost, Mattermost, Timeline, WireError, indexed_title,
+    BoundChannel, CreatedDirectMessage, CreatedPost, Mattermost, Session, Timeline, WireError,
+    indexed_title,
 };
 use crate::appserver;
 use crate::relay::Reservation;
@@ -314,12 +316,22 @@ impl WireServer {
     )]
     async fn post(
         &self,
+        meta: RequestMetaObject,
         Parameters(args): Parameters<PostArgs>,
     ) -> Result<CallToolResult, McpError> {
         validate_post(&args)?;
+        let session = match Session::from_request(&meta) {
+            Ok(session) => session,
+            Err(error) => return Ok(tool_error(&error)),
+        };
         match self
             .api
-            .post(&args.channel, &args.message, args.reply_to.as_deref())
+            .post(
+                &session,
+                &args.channel,
+                &args.message,
+                args.reply_to.as_deref(),
+            )
             .await
         {
             Ok(created) => render(PostOutput::from(created), args.render, DetailLevel::Concise),
@@ -341,13 +353,18 @@ impl WireServer {
     )]
     async fn direct_message(
         &self,
+        meta: RequestMetaObject,
         Parameters(args): Parameters<DirectMessageArgs>,
     ) -> Result<CallToolResult, McpError> {
         validate_message(&args.message, args.reply_to.as_deref())?;
+        let session = match Session::from_request(&meta) {
+            Ok(session) => session,
+            Err(error) => return Ok(tool_error(&error)),
+        };
         let Some(target) = args.session_id else {
             return match self
                 .api
-                .direct_message(&args.message, args.reply_to.as_deref())
+                .direct_message(&session, &args.message, args.reply_to.as_deref())
                 .await
             {
                 Ok(created) => render(
@@ -358,11 +375,9 @@ impl WireServer {
                 Err(error) => Ok(tool_error(&error)),
             };
         };
-        let sender_session = match self.api.session_id() {
-            Ok(session) if session != target => session,
-            Ok(_) => return Err(invalid("session_id cannot name the calling session")),
-            Err(error) => return Ok(tool_error(&error)),
-        };
+        if session.id() == target {
+            return Err(invalid("session_id cannot name the calling session"));
+        }
         let reservation = match Reservation::open(target).await {
             Ok(reservation) => reservation,
             Err(error) => {
@@ -373,7 +388,7 @@ impl WireServer {
         };
         let created = match self
             .api
-            .peer_direct_message(target, &args.message, args.reply_to.as_deref())
+            .peer_direct_message(&session, target, &args.message, args.reply_to.as_deref())
             .await
         {
             Ok(created) => created,
@@ -383,7 +398,7 @@ impl WireServer {
         if let Err(error) = reservation
             .enqueue(
                 created.post.id.clone(),
-                sender_session,
+                session.id(),
                 created.sender,
                 args.message,
             )

@@ -10,6 +10,7 @@ use std::{
 };
 
 use reqwest::{Client, RequestBuilder, StatusCode};
+use rmcp::model::RequestMetaObject;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::{
@@ -30,8 +31,7 @@ pub(crate) struct Mattermost {
     base: String,
     client: Client,
     admin_token: String,
-    session: Option<Session>,
-    identity: Arc<OnceCell<Identity>>,
+    identities: Arc<IdentityRegistry>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -99,7 +99,7 @@ pub(crate) struct CreatedDirectMessage {
 }
 
 #[derive(Clone, Debug)]
-struct Session {
+pub(crate) struct Session {
     id: Uuid,
     title: Option<String>,
 }
@@ -110,6 +110,24 @@ struct Identity {
     token: String,
     profile: Mutex<Profile>,
     channels: Mutex<HashSet<String>>,
+}
+
+type IdentitySlot = OnceCell<Arc<Identity>>;
+
+#[derive(Debug, Default)]
+struct IdentityRegistry {
+    slots: Mutex<HashMap<Uuid, Arc<IdentitySlot>>>,
+}
+
+impl IdentityRegistry {
+    async fn slot(&self, session: Uuid) -> Arc<IdentitySlot> {
+        let mut slots = self.slots.lock().await;
+        Arc::clone(
+            slots
+                .entry(session)
+                .or_insert_with(|| Arc::new(OnceCell::new())),
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -166,11 +184,35 @@ pub(crate) enum WireError {
 }
 
 impl Session {
+    pub(crate) fn from_request(meta: &RequestMetaObject) -> Result<Self, WireError> {
+        if let Some(value) = meta.get("threadId") {
+            let raw = value.as_str().ok_or_else(|| {
+                WireError::Configuration("request threadId metadata is not a string".to_owned())
+            })?;
+            let id = Uuid::parse_str(raw).map_err(|error| {
+                WireError::Configuration(format!(
+                    "request threadId metadata is not a UUID: {error}"
+                ))
+            })?;
+            return Ok(Self::for_id(id));
+        }
+        Self::load()?.ok_or_else(|| {
+            WireError::Configuration(
+                "writes require Codex threadId request metadata, CODEX_THREAD_ID, or WIRE_SESSION_ID"
+                    .to_owned(),
+            )
+        })
+    }
+
     fn for_id(id: Uuid) -> Self {
         Self {
             id,
             title: indexed_title(id),
         }
+    }
+
+    pub(crate) const fn id(&self) -> Uuid {
+        self.id
     }
 
     fn load() -> Result<Option<Self>, WireError> {
@@ -267,8 +309,7 @@ impl Mattermost {
             base: base.trim_end_matches('/').to_owned(),
             client,
             admin_token,
-            session: Session::load()?,
-            identity: Arc::new(OnceCell::new()),
+            identities: Arc::new(IdentityRegistry::default()),
         })
     }
 
@@ -318,10 +359,6 @@ impl Mattermost {
 
     pub(crate) fn admin_token(&self) -> &str {
         &self.admin_token
-    }
-
-    pub(crate) fn session_id(&self) -> Result<Uuid, WireError> {
-        Ok(self.current_session()?.id)
     }
 
     pub(crate) async fn operator(&self) -> Result<User, WireError> {
@@ -445,14 +482,15 @@ impl Mattermost {
 
     pub(crate) async fn post(
         &self,
+        session: &Session,
         selector: &str,
         message: &str,
         reply_to: Option<&str>,
     ) -> Result<CreatedPost, WireError> {
         let channel = self.resolve_channel(selector).await?;
-        let identity = self.identity().await?;
-        let sender = self.sync_profile(identity).await?;
-        self.ensure_membership(identity, &channel).await?;
+        let identity = self.identity(session).await?;
+        let sender = self.sync_profile(&identity, session).await?;
+        self.ensure_membership(&identity, &channel).await?;
         let post = self
             .post_json_as(
                 &identity.token,
@@ -473,11 +511,12 @@ impl Mattermost {
 
     pub(crate) async fn direct_message(
         &self,
+        session: &Session,
         message: &str,
         reply_to: Option<&str>,
     ) -> Result<CreatedDirectMessage, WireError> {
-        let identity = self.identity().await?;
-        let sender = self.sync_profile(identity).await?;
+        let identity = self.identity(session).await?;
+        let sender = self.sync_profile(&identity, session).await?;
         let recipient: User = self
             .get(&format!("/users/username/{OPERATOR_USERNAME}"))
             .await?;
@@ -508,12 +547,13 @@ impl Mattermost {
 
     pub(crate) async fn peer_direct_message(
         &self,
+        session: &Session,
         recipient_id: Uuid,
         message: &str,
         reply_to: Option<&str>,
     ) -> Result<CreatedDirectMessage, WireError> {
-        let identity = self.identity().await?;
-        let sender = self.sync_profile(identity).await?;
+        let identity = self.identity(session).await?;
+        let sender = self.sync_profile(&identity, session).await?;
         let recipient = self.ensure_bot(&Session::for_id(recipient_id)).await?;
         let channel: Channel = self
             .post_json_as(
@@ -540,13 +580,13 @@ impl Mattermost {
         })
     }
 
-    async fn identity(&self) -> Result<&Identity, WireError> {
-        self.identity
+    async fn identity(&self, session: &Session) -> Result<Arc<Identity>, WireError> {
+        let slot = self.identities.slot(session.id).await;
+        let identity = slot
             .get_or_try_init(|| async {
-                let session = self.current_session()?;
                 let bot = self.ensure_bot(session).await?;
                 let token = self.identity_token(session, &bot).await?;
-                Ok(Identity {
+                Ok::<_, WireError>(Arc::new(Identity {
                     user_id: bot.user_id,
                     token,
                     profile: Mutex::new(Profile {
@@ -554,38 +594,25 @@ impl Mattermost {
                         username: bot.username,
                     }),
                     channels: Mutex::new(HashSet::new()),
-                })
+                }))
             })
-            .await
+            .await?;
+        Ok(Arc::clone(identity))
     }
 
-    fn current_session(&self) -> Result<&Session, WireError> {
-        self.session.as_ref().ok_or_else(|| {
-            WireError::Configuration(
-                "chat.post requires CODEX_THREAD_ID or WIRE_SESSION_ID".to_owned(),
-            )
-        })
-    }
-
-    async fn sync_profile(&self, identity: &Identity) -> Result<String, WireError> {
-        let Some(session) = Session::load()? else {
-            return Err(WireError::Configuration(
-                "chat.post requires CODEX_THREAD_ID or WIRE_SESSION_ID".to_owned(),
-            ));
-        };
-        if session.id != self.current_session()?.id {
-            return Err(WireError::Configuration(
-                "session identity changed after Wire started".to_owned(),
-            ));
-        }
+    async fn sync_profile(
+        &self,
+        identity: &Identity,
+        session: &Session,
+    ) -> Result<String, WireError> {
         let mut profile = identity.profile.lock().await;
         if profile.title == session.title {
             return Ok(profile.username.clone());
         }
         let bot: Bot = self.get(&format!("/bots/{}", identity.user_id)).await?;
-        let bot = self.sync_bot_profile(&session, bot).await?;
+        let bot = self.sync_bot_profile(session, bot).await?;
         *profile = Profile {
-            title: session.title,
+            title: session.title.clone(),
             username: bot.username.clone(),
         };
         Ok(bot.username)
