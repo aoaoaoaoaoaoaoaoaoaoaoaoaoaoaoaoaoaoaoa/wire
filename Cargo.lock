@@ -239,8 +239,8 @@ dependencies = [
 
 [[package]]
 name = "codex-census"
-version = "1.3.12"
-source = "git+https://github.com/aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/codex-wrangler.git?rev=cfc8359296ea0a18ff43de81c3f96cbc5d606de5#cfc8359296ea0a18ff43de81c3f96cbc5d606de5"
+version = "1.3.15"
+source = "git+https://github.com/aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/codex-wrangler.git?rev=cfa582c600cb1a2cb8453109757a25e22faf4168#cfa582c600cb1a2cb8453109757a25e22faf4168"
 dependencies = [
  "anyhow",
  "uuid",
@@ -2348,7 +2348,7 @@ dependencies = [
 
 [[package]]
 name = "wire"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "clap",
  "codex-census",

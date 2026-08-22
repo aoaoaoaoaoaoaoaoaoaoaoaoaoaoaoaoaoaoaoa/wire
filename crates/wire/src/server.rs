@@ -331,7 +331,7 @@ impl WireServer {
         name = "chat.dm",
         description = "Post a direct message to a live Codex session, or omit session_id to reach the human operator in distress. Agent delivery is advisory and best effort.",
         annotations(
-            title = "Message the human operator",
+            title = "Post direct message",
             read_only_hint = false,
             destructive_hint = false,
             idempotent_hint = false,

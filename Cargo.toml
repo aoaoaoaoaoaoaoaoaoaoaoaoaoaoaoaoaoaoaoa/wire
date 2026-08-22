@@ -11,11 +11,11 @@ license = "MIT"
 readme = "README.md"
 repository = "https://github.com/aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/wire"
 rust-version = "1.97"
-version = "0.3.0"
+version = "0.3.1"
 
 [workspace.dependencies]
 clap = { version = "4.5", features = ["derive"] }
-codex-census = { git = "https://github.com/aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/codex-wrangler.git", rev = "cfc8359296ea0a18ff43de81c3f96cbc5d606de5" }
+codex-census = { git = "https://github.com/aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/codex-wrangler.git", rev = "cfa582c600cb1a2cb8453109757a25e22faf4168" }
 futures-util = "0.3"
 libmcp = { git = "https://github.com/aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/libmcp.git", rev = "387ae7f2025298d473284872bd201d804755dcd8" }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
