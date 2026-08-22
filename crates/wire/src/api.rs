@@ -145,6 +145,12 @@ struct Bot {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+struct ProvisionalUser {
+    id: String,
+    email: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct ChannelMember {
     user_id: String,
 }
@@ -234,6 +240,10 @@ impl Session {
 
     fn description(&self) -> String {
         format!("Codex session {}", self.id)
+    }
+
+    fn provisional_email(&self) -> String {
+        format!("wire-{}@localhost", self.id.simple())
     }
 
     fn display_name(&self) -> String {
@@ -622,36 +632,97 @@ impl Mattermost {
         if let Some(bot) = self.find_bot(session).await? {
             return self.sync_bot_profile(session, bot).await;
         }
+        let email = session.provisional_email();
         for username in session.username_candidates() {
-            if !self.username_available(&username, None).await? {
+            let provisional = match self
+                .get_optional::<ProvisionalUser>(&format!("/users/username/{username}"))
+                .await?
+            {
+                Some(user) => user,
+                None => match self
+                    .create_provisional_user(session, &username, &email)
+                    .await
+                {
+                    Ok(user) => user,
+                    // Another worker may have won the same provisioning race.
+                    Err(WireError::Response {
+                        status: StatusCode::BAD_REQUEST,
+                        ..
+                    }) => {
+                        let Some(user) = self
+                            .get_optional::<ProvisionalUser>(&format!("/users/username/{username}"))
+                            .await?
+                        else {
+                            continue;
+                        };
+                        user
+                    }
+                    Err(error) => return Err(error),
+                },
+            };
+            if provisional.email != email {
                 continue;
             }
-            let created = self
-                .post_json(
-                    "/bots",
-                    &serde_json::json!({
-                        "username": username,
-                        "display_name": session.display_name(),
-                        "description": session.description(),
-                    }),
-                )
-                .await;
-            match created {
-                Ok(bot) => return Ok(bot),
-                Err(WireError::Response {
-                    status: StatusCode::BAD_REQUEST,
-                    ..
-                }) => {
-                    if let Some(bot) = self.find_bot(session).await? {
-                        return self.sync_bot_profile(session, bot).await;
-                    }
-                }
-                Err(error) => return Err(error),
-            }
+            return self.convert_provisional_user(session, &provisional).await;
         }
         Err(WireError::Configuration(
             "no available Mattermost username for this session".to_owned(),
         ))
+    }
+
+    async fn create_provisional_user(
+        &self,
+        session: &Session,
+        username: &str,
+        email: &str,
+    ) -> Result<ProvisionalUser, WireError> {
+        self.post_json(
+            "/users",
+            &serde_json::json!({
+                "username": username,
+                "email": email,
+                "password": format!("wire-{}", Uuid::new_v4().simple()),
+                "first_name": session.display_name(),
+                "email_verified": true,
+                "disable_welcome_email": true,
+            }),
+        )
+        .await
+    }
+
+    async fn convert_provisional_user(
+        &self,
+        session: &Session,
+        user: &ProvisionalUser,
+    ) -> Result<Bot, WireError> {
+        if let Some(bot) = self
+            .get_optional::<Bot>(&format!("/bots/{}", user.id))
+            .await?
+        {
+            return self.sync_bot_profile(session, bot).await;
+        }
+
+        // Mattermost's bot-creation endpoint unconditionally DMs its caller.
+        // User conversion produces the same identity without that side effect.
+        let converted = self
+            .post_json(
+                &format!("/users/{}/convert_to_bot", user.id),
+                &serde_json::json!({}),
+            )
+            .await;
+        match converted {
+            Ok(bot) => self.sync_bot_profile(session, bot).await,
+            Err(error) => {
+                if let Some(bot) = self
+                    .get_optional::<Bot>(&format!("/bots/{}", user.id))
+                    .await?
+                {
+                    self.sync_bot_profile(session, bot).await
+                } else {
+                    Err(error)
+                }
+            }
+        }
     }
 
     async fn find_bot(&self, session: &Session) -> Result<Option<Bot>, WireError> {
@@ -674,28 +745,39 @@ impl Mattermost {
 
     async fn sync_bot_profile(&self, session: &Session, bot: Bot) -> Result<Bot, WireError> {
         let display_name = session.display_name();
-        if bot.display_name == display_name {
+        let description = session.description();
+        let candidates = session.username_candidates();
+        if bot.display_name == display_name
+            && bot.description.as_deref() == Some(description.as_str())
+            && candidates.contains(&bot.username)
+        {
             return Ok(bot);
         }
-        let mut username = None;
-        for candidate in session.username_candidates() {
-            if self
-                .username_available(&candidate, Some(&bot.user_id))
-                .await?
-            {
-                username = Some(candidate);
-                break;
+        let username = if candidates.contains(&bot.username) {
+            bot.username.clone()
+        } else {
+            let mut available = None;
+            for candidate in candidates {
+                if self
+                    .username_available(&candidate, Some(&bot.user_id))
+                    .await?
+                {
+                    available = Some(candidate);
+                    break;
+                }
             }
-        }
-        let username = username.ok_or_else(|| {
-            WireError::Configuration("no available Mattermost username for this session".to_owned())
-        })?;
+            available.ok_or_else(|| {
+                WireError::Configuration(
+                    "no available Mattermost username for this session".to_owned(),
+                )
+            })?
+        };
         self.put_json(
             &format!("/bots/{}", bot.user_id),
             &serde_json::json!({
                 "username": username,
                 "display_name": display_name,
-                "description": session.description(),
+                "description": description,
             }),
         )
         .await

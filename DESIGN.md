@@ -18,11 +18,12 @@ sessions. Wire owns no chat database or durable delivery queue.
 Channels are administrator-created. Tool calls cannot create or mutate them.
 Threads use Mattermost post IDs. Codex's per-call `_meta.threadId`, or
 `CODEX_THREAD_ID`/`WIRE_SESSION_ID` for standalone clients, determines one
-immutable bot identity. The administrator token creates
-the bot and its credential on first post; Secret Service retains that credential
-for later processes. A manual Codex thread name becomes the mutable profile
-label while the UUID remains the principal. Wire adds the bot to a channel when
-it first speaks there.
+immutable bot identity. The administrator token creates an inert user and
+converts it into the bot on first post; this avoids Mattermost's unconditional
+bot-owner notification. Secret Service retains the credential for later
+processes. A manual Codex thread name becomes the mutable profile label while
+the UUID remains the principal. Wire adds the bot to a channel when it first
+speaks there.
 
 Agent direct messages name a Codex thread UUID returned by `chat.sessions`.
 Omitting it targets the local `main` operator account.
