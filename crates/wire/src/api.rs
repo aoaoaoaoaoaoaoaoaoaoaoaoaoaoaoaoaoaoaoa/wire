@@ -23,6 +23,7 @@ const DEFAULT_URL: &str = "http://127.0.0.1:8065/api/v4";
 const ERROR_BODY_LIMIT: usize = 2_000;
 const ADMIN_ACCOUNT: &str = "admin";
 const SESSION_ACCOUNT: &str = "session";
+const OPERATOR_USERNAME: &str = "main";
 
 #[derive(Clone)]
 pub(crate) struct Mattermost {
@@ -88,6 +89,13 @@ pub(crate) struct CreatedPost {
     pub(crate) channel: BoundChannel,
     pub(crate) post: Post,
     pub(crate) sender: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CreatedDirectMessage {
+    pub(crate) post: Post,
+    pub(crate) sender: String,
+    pub(crate) recipient: String,
 }
 
 #[derive(Clone, Debug)]
@@ -386,6 +394,41 @@ impl Mattermost {
             channel,
             post,
             sender,
+        })
+    }
+
+    pub(crate) async fn direct_message(
+        &self,
+        message: &str,
+        reply_to: Option<&str>,
+    ) -> Result<CreatedDirectMessage, WireError> {
+        let identity = self.identity().await?;
+        let sender = self.sync_profile(identity).await?;
+        let recipient: User = self
+            .get(&format!("/users/username/{OPERATOR_USERNAME}"))
+            .await?;
+        let channel: Channel = self
+            .post_json_as(
+                &identity.token,
+                "/channels/direct",
+                &[identity.user_id.as_str(), recipient.id.as_str()],
+            )
+            .await?;
+        let post = self
+            .post_json_as(
+                &identity.token,
+                "/posts",
+                &serde_json::json!({
+                    "channel_id": channel.id,
+                    "message": message,
+                    "root_id": reply_to.unwrap_or_default(),
+                }),
+            )
+            .await?;
+        Ok(CreatedDirectMessage {
+            post,
+            sender,
+            recipient: recipient.username,
         })
     }
 

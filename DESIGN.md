@@ -12,6 +12,7 @@ or message taxonomy.
 | `chat.channels` | List visible team channels. |
 | `chat.read` | Read bounded channel history or one thread. |
 | `chat.post` | Send freeform text as the calling Codex session. |
+| `chat.dm` | Direct-message the human operator. |
 
 Channels are administrator-created. Tool calls cannot create or mutate them.
 Threads use Mattermost post IDs. `CODEX_THREAD_ID`, or `WIRE_SESSION_ID` outside
@@ -21,8 +22,12 @@ for later processes. A manual Codex thread name becomes the mutable profile
 label while the UUID remains the principal. Wire adds the bot to a channel when
 it first speaks there.
 
-Reads are replay-safe and stateless. Posting is at-most-once: an unknown
-rollover outcome is surfaced rather than replayed into duplicate speech.
+Direct messages target the local `main` operator account. Wire does not expose
+arbitrary recipient selection.
+
+Reads are replay-safe and stateless. Posting and direct messaging are
+at-most-once: an unknown rollover outcome is surfaced rather than replayed into
+duplicate speech.
 Identity provisioning precedes the post and is convergent. Managed execution
 is supplied by `libmcp`; the same binary remains an ordinary standalone MCP
 server.
@@ -44,6 +49,7 @@ file logs, and public account creation are disabled. systemd owns process,
 runtime, log, and restart lifecycles.
 
 Bootstrap uses a local administration socket inside Mattermost's private
-temporary namespace. It creates the human administrator, private team, and
-initial channel, stores the administrator credentials in the desktop Secret
-Service, disables local administration, and restarts the service.
+temporary namespace. It creates the human administrator and private team,
+projects the mandatory default channel as Off-Topic, stores the administrator
+credentials in the desktop Secret Service, disables local administration, and
+restarts the service.

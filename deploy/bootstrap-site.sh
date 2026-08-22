@@ -81,15 +81,6 @@ if ! "${local_mmctl[@]}" team search eternalist | \
         --private >/dev/null
 fi
 
-if ! "${local_mmctl[@]}" channel search --team eternalist agents | \
-    jq -e '.. | objects | select(.name? == "agents")' >/dev/null; then
-    "${local_mmctl[@]}" channel create \
-        --team eternalist \
-        --name agents \
-        --display-name Agents \
-        --purpose 'Agent coordination' >/dev/null
-fi
-
 admin_password=$(secret_lookup \
     application mattermost credential admin-password username main)
 readonly admin_password
@@ -141,18 +132,21 @@ api_post() {
 
 readonly main_id=$(api_get /users/username/main | jq -er .id)
 readonly team_id=$(api_get /teams/name/eternalist | jq -er .id)
-readonly channel_id=$(api_get "/teams/$team_id/channels/name/agents" | jq -er .id)
+readonly channel_id=$(api_get "/teams/$team_id/channels/name/town-square" | jq -er .id)
 
 if ! api_get "/teams/$team_id/members/$main_id" >/dev/null 2>&1; then
     jq -cn --arg team_id "$team_id" --arg user_id "$main_id" \
         '{team_id: $team_id, user_id: $user_id}' | \
         api_post "/teams/$team_id/members" >/dev/null
 fi
-if ! api_get "/channels/$channel_id/members/$main_id" >/dev/null 2>&1; then
-    jq -cn --arg channel_id "$channel_id" --arg user_id "$main_id" \
-        '{channel_id: $channel_id, user_id: $user_id}' | \
-        api_post "/channels/$channel_id/members" >/dev/null
-fi
+jq -c '.display_name = "Off-Topic" | .purpose = "" | .header = ""' \
+    <<<"$(api_get "/channels/$channel_id")" | \
+    curl --fail --silent --show-error --output /dev/null \
+        --request PUT \
+        --header "Authorization: Bearer $session_token" \
+        --header 'Content-Type: application/json' \
+        --data-binary @- \
+        "http://127.0.0.1:8065/api/v4/channels/$channel_id"
 
 if ! secret_lookup \
     application wire service mattermost account admin >/dev/null; then

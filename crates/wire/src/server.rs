@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use crate::api::{BoundChannel, CreatedPost, Mattermost, Timeline, WireError};
+use crate::api::{
+    BoundChannel, CreatedDirectMessage, CreatedPost, Mattermost, Timeline, WireError,
+};
 
 const DEFAULT_LIMIT: usize = 20;
 const MAX_LIMIT: usize = 100;
@@ -75,6 +77,17 @@ struct PostArgs {
     render: RenderMode,
 }
 
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DirectMessageArgs {
+    #[serde(default)]
+    message: String,
+    #[schemars(description = "Optional thread root post ID.")]
+    reply_to: Option<String>,
+    #[serde(default)]
+    render: RenderMode,
+}
+
 #[derive(Clone, Debug, JsonSchema, Serialize)]
 struct ChannelOutput {
     id: String,
@@ -115,12 +128,20 @@ struct PostOutput {
     reply_to: Option<String>,
 }
 
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+struct DirectMessageOutput {
+    id: String,
+    sender: String,
+    recipient: String,
+    reply_to: Option<String>,
+}
+
 #[tool_router]
 impl WireServer {
     fn new(api: Mattermost) -> Self {
         let mut tool_router = Self::tool_router();
         for (name, route) in &mut tool_router.map {
-            let recovery = if name.as_ref() == "chat.post" {
+            let recovery = if matches!(name.as_ref(), "chat.post" | "chat.dm") {
                 "at_most_once"
             } else {
                 "replay_safe"
@@ -239,6 +260,37 @@ impl WireServer {
             Err(error) => Ok(tool_error(&error)),
         }
     }
+
+    #[tool(
+        name = "chat.dm",
+        description = "Direct-message the human operator as this Codex session. Reserve for distress, not trivialities.",
+        annotations(
+            title = "Message the human operator",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        ),
+        output_schema = output_schema::<DirectMessageOutput>()
+    )]
+    async fn direct_message(
+        &self,
+        Parameters(args): Parameters<DirectMessageArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        validate_message(&args.message, args.reply_to.as_deref())?;
+        match self
+            .api
+            .direct_message(&args.message, args.reply_to.as_deref())
+            .await
+        {
+            Ok(created) => render(
+                DirectMessageOutput::from(created),
+                args.render,
+                DetailLevel::Concise,
+            ),
+            Err(error) => Ok(tool_error(&error)),
+        }
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -246,7 +298,7 @@ impl ServerHandler for WireServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(
-                "Use chat.channels to discover administrator-created channels. Read with chat.read. Post useful freeform coordination with chat.post. Each Codex session has one stable Mattermost bot identity."
+                "Use chat.channels to discover human-created channels. Read with chat.read and coordinate with chat.post. Use chat.dm only to reach the human operator in distress. Each Codex session has one stable Mattermost bot identity."
             )
             .with_server_info(Implementation::new("wire", env!("CARGO_PKG_VERSION")))
     }
@@ -308,9 +360,23 @@ impl ReadOutput {
 impl From<CreatedPost> for PostOutput {
     fn from(value: CreatedPost) -> Self {
         Self {
-            channel: format!("{}:{}", value.channel.team.name, value.channel.channel.name),
+            channel: format!(
+                "{}:{}",
+                value.channel.team.name, value.channel.channel.display_name
+            ),
             id: value.post.id,
             sender: value.sender,
+            reply_to: (!value.post.root_id.is_empty()).then_some(value.post.root_id),
+        }
+    }
+}
+
+impl From<CreatedDirectMessage> for DirectMessageOutput {
+    fn from(value: CreatedDirectMessage) -> Self {
+        Self {
+            id: value.post.id,
+            sender: value.sender,
+            recipient: value.recipient,
             reply_to: (!value.post.root_id.is_empty()).then_some(value.post.root_id),
         }
     }
@@ -322,11 +388,11 @@ trait Porcelain {
 
 impl Porcelain for ChannelsOutput {
     fn porcelain(&self, _detail: DetailLevel) -> String {
-        let mut lines = vec!["channel | id | display | messages".to_owned()];
+        let mut lines = vec!["channel | id | messages".to_owned()];
         lines.extend(self.channels.iter().map(|channel| {
             format!(
-                "{}:{} | {} | {} | {}",
-                channel.team, channel.name, channel.id, channel.display_name, channel.message_count
+                "{}:{} | {} | {}",
+                channel.team, channel.display_name, channel.id, channel.message_count
             )
         }));
         lines.join("\n")
@@ -338,7 +404,7 @@ impl Porcelain for ReadOutput {
         let mut lines = vec![format!(
             "{}:{} | {} message(s)",
             self.channel.team,
-            self.channel.name,
+            self.channel.display_name,
             self.messages.len()
         )];
         for message in &self.messages {
@@ -367,6 +433,12 @@ impl Porcelain for ReadOutput {
 impl Porcelain for PostOutput {
     fn porcelain(&self, _detail: DetailLevel) -> String {
         format!("posted {} | {} | @{}", self.id, self.channel, self.sender)
+    }
+}
+
+impl Porcelain for DirectMessageOutput {
+    fn porcelain(&self, _detail: DetailLevel) -> String {
+        format!("sent {} | @{} -> @{}", self.id, self.sender, self.recipient)
     }
 }
 
@@ -401,15 +473,19 @@ fn validate_limit(limit: usize) -> Result<(), McpError> {
 }
 
 fn validate_post(args: &PostArgs) -> Result<(), McpError> {
-    if args.message.is_empty() {
+    validate_message(&args.message, args.reply_to.as_deref())
+}
+
+fn validate_message(message: &str, reply_to: Option<&str>) -> Result<(), McpError> {
+    if message.is_empty() {
         return Err(invalid("message must be present"));
     }
-    if args.message.chars().count() > MAX_MESSAGE_CHARS {
+    if message.chars().count() > MAX_MESSAGE_CHARS {
         return Err(invalid(format!(
             "message exceeds {MAX_MESSAGE_CHARS} characters"
         )));
     }
-    validate_optional_id(args.reply_to.as_deref(), "reply_to")?;
+    validate_optional_id(reply_to, "reply_to")?;
     Ok(())
 }
 
