@@ -1,4 +1,6 @@
 mod api;
+mod appserver;
+mod relay;
 mod server;
 
 use std::process::ExitCode;
@@ -19,6 +21,8 @@ enum Command {
         #[command(subcommand)]
         command: McpCommand,
     },
+    /// Relay live direct messages into live Codex sessions.
+    Relay,
 }
 
 #[derive(Subcommand)]
@@ -29,7 +33,7 @@ enum McpCommand {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    match run().await {
+    match Box::pin(run()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("wire: {error}");
@@ -43,6 +47,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Mcp {
             command: McpCommand::Serve,
         } => server::serve(api::Mattermost::load()?).await?,
+        Command::Relay => Box::pin(relay::serve(api::Mattermost::load()?)).await?,
     }
     Ok(())
 }

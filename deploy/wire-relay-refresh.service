@@ -1,0 +1,6 @@
+[Unit]
+Description=Adopt the selected Wire relay release
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl --user try-restart wire-relay.service

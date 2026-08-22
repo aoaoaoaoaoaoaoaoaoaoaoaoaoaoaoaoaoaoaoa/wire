@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly depot="${XDG_DATA_HOME:-${HOME}/.local/share}/mcp-depot/servers/wire"
+readonly manifest=$(jq -er '.manifest' "$depot/current.json")
+readonly generation=$(basename -- "$(dirname -- "$manifest")")
+[[ $generation =~ ^[0-9a-f]{64}$ ]] || {
+    printf 'wire relay: invalid depot generation\n' >&2
+    exit 78
+}
+[[ $manifest == "$depot/releases/$generation/manifest.json" ]] || {
+    printf 'wire relay: selected manifest escaped the depot\n' >&2
+    exit 78
+}
+readonly server="${manifest%/manifest.json}/server"
+[[ -x $server ]] || {
+    printf 'wire relay: selected executable is absent\n' >&2
+    exit 69
+}
+exec "$server" relay

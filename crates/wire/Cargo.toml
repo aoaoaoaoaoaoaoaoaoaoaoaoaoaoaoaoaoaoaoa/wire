@@ -12,6 +12,8 @@ version.workspace = true
 
 [dependencies]
 clap.workspace = true
+codex-census.workspace = true
+futures-util.workspace = true
 libmcp.workspace = true
 reqwest.workspace = true
 rmcp.workspace = true
@@ -21,6 +23,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
+tokio-tungstenite.workspace = true
 uuid.workspace = true
 
 [lints]

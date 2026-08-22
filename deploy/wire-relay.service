@@ -1,0 +1,34 @@
+[Unit]
+Description=Best-effort Mattermost relay for live Codex sessions
+After=mcp-depot.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/libexec/wire-relay
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=10s
+UMask=0077
+
+RuntimeDirectory=wire
+RuntimeDirectoryMode=0700
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=read-only
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+TasksMax=96
+MemoryMax=192M
+
+[Install]
+WantedBy=default.target

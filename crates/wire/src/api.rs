@@ -126,6 +126,11 @@ struct Bot {
     description: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct ChannelMember {
+    user_id: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct SessionIndexRow {
     id: Uuid,
@@ -161,6 +166,13 @@ pub(crate) enum WireError {
 }
 
 impl Session {
+    fn for_id(id: Uuid) -> Self {
+        Self {
+            id,
+            title: indexed_title(id),
+        }
+    }
+
     fn load() -> Result<Option<Self>, WireError> {
         let raw = ["CODEX_THREAD_ID", "WIRE_SESSION_ID"]
             .into_iter()
@@ -282,6 +294,68 @@ impl Mattermost {
             (&left.team.name, &left.channel.name).cmp(&(&right.team.name, &right.channel.name))
         });
         Ok(channels)
+    }
+
+    pub(crate) fn websocket_url(&self) -> Result<String, WireError> {
+        let mut url = reqwest::Url::parse(&self.base)
+            .map_err(|error| WireError::Configuration(format!("WIRE_URL: {error}")))?;
+        let websocket_scheme = match url.scheme() {
+            "http" => "ws",
+            "https" => "wss",
+            _ => {
+                return Err(WireError::Configuration(
+                    "WIRE_URL does not project to a WebSocket URL".to_owned(),
+                ));
+            }
+        };
+        url.set_scheme(websocket_scheme).map_err(|()| {
+            WireError::Configuration("WIRE_URL does not admit a WebSocket scheme".to_owned())
+        })?;
+        let path = format!("{}/websocket", url.path().trim_end_matches('/'));
+        url.set_path(&path);
+        Ok(url.to_string())
+    }
+
+    pub(crate) fn admin_token(&self) -> &str {
+        &self.admin_token
+    }
+
+    pub(crate) fn session_id(&self) -> Result<Uuid, WireError> {
+        Ok(self.current_session()?.id)
+    }
+
+    pub(crate) async fn operator(&self) -> Result<User, WireError> {
+        self.get(&format!("/users/username/{OPERATOR_USERNAME}"))
+            .await
+    }
+
+    pub(crate) async fn direct_session(
+        &self,
+        channel_id: &str,
+        operator_id: &str,
+    ) -> Result<Option<Uuid>, WireError> {
+        let members: Vec<ChannelMember> =
+            self.get(&format!("/channels/{channel_id}/members")).await?;
+        let mut recipients = members
+            .into_iter()
+            .filter(|member| member.user_id != operator_id);
+        let Some(recipient) = recipients.next() else {
+            return Ok(None);
+        };
+        if recipients.next().is_some() {
+            return Ok(None);
+        }
+        let bot = self
+            .get_optional::<Bot>(&format!("/bots/{}", recipient.user_id))
+            .await?;
+        Ok(bot
+            .and_then(|bot| bot.description)
+            .and_then(|description| {
+                description
+                    .strip_prefix("Codex session ")
+                    .map(str::to_owned)
+            })
+            .and_then(|id| Uuid::parse_str(&id).ok()))
     }
 
     pub(crate) async fn resolve_channel(&self, selector: &str) -> Result<BoundChannel, WireError> {
@@ -412,6 +486,40 @@ impl Mattermost {
                 &identity.token,
                 "/channels/direct",
                 &[identity.user_id.as_str(), recipient.id.as_str()],
+            )
+            .await?;
+        let post = self
+            .post_json_as(
+                &identity.token,
+                "/posts",
+                &serde_json::json!({
+                    "channel_id": channel.id,
+                    "message": message,
+                    "root_id": reply_to.unwrap_or_default(),
+                }),
+            )
+            .await?;
+        Ok(CreatedDirectMessage {
+            post,
+            sender,
+            recipient: recipient.username,
+        })
+    }
+
+    pub(crate) async fn peer_direct_message(
+        &self,
+        recipient_id: Uuid,
+        message: &str,
+        reply_to: Option<&str>,
+    ) -> Result<CreatedDirectMessage, WireError> {
+        let identity = self.identity().await?;
+        let sender = self.sync_profile(identity).await?;
+        let recipient = self.ensure_bot(&Session::for_id(recipient_id)).await?;
+        let channel: Channel = self
+            .post_json_as(
+                &identity.token,
+                "/channels/direct",
+                &[identity.user_id.as_str(), recipient.user_id.as_str()],
             )
             .await?;
         let post = self
@@ -886,7 +994,7 @@ fn secret_output(output: std::process::Output) -> Result<Option<String>, WireErr
     Ok((!token.is_empty()).then_some(token))
 }
 
-fn indexed_title(id: Uuid) -> Option<String> {
+pub(crate) fn indexed_title(id: Uuid) -> Option<String> {
     let path = env::var_os("CODEX_HOME").map_or_else(
         || {
             env::var_os("HOME")
