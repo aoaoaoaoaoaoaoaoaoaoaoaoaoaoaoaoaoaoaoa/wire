@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     env, fs, io,
     os::unix::{
         fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _},
@@ -32,7 +32,7 @@ use tokio_tungstenite::{
 
 use crate::{
     api::{Mattermost, Post, WireError},
-    appserver::{self, HumanMessage, Injection, PeerMessage},
+    appserver::{self, AdvisorySource, HumanMessage, Injection, PeerMessage},
 };
 
 const RELAY_SOCKET: &str = "wire/relay.sock";
@@ -41,6 +41,8 @@ const LOCAL_TIMEOUT: Duration = Duration::from_secs(10);
 const RESERVATION_TIMEOUT: Duration = Duration::from_mins(5);
 const COALESCE_FOR: Duration = Duration::from_millis(750);
 const MAX_LOCAL_CLIENTS: usize = 64;
+const MAX_BATCH_MESSAGES: usize = 8;
+const RECENT_POSTS: usize = 1_024;
 
 #[derive(Debug, Error)]
 pub(crate) enum RelayError {
@@ -199,11 +201,11 @@ pub(crate) async fn serve(api: Mattermost) -> Result<(), RelayError> {
     let (listener, _socket) = bind_socket()?;
     let (deliveries, receiver) = mpsc::channel(256);
     let peer = serve_local(listener, deliveries.clone());
-    let human = serve_human(api, deliveries);
+    let mattermost = serve_mattermost(api, deliveries);
     let dispatch = dispatch(receiver);
     tokio::select! {
         result = peer => result,
-        result = human => result,
+        result = mattermost => result,
         () = dispatch => Err(RelayError::Protocol("delivery dispatcher stopped".to_owned())),
     }
 }
@@ -293,6 +295,7 @@ async fn handle_local(
                 post_id,
                 sender_session,
                 sender,
+                source: AdvisorySource::Direct,
                 body,
             }),
         })
@@ -301,14 +304,16 @@ async fn handle_local(
     write_frame(&mut stream, &LocalResponse::Queued).await
 }
 
-async fn serve_human(
+async fn serve_mattermost(
     api: Mattermost,
     deliveries: mpsc::Sender<Delivery>,
 ) -> Result<(), RelayError> {
     let operator = api.operator().await?;
+    let mut seen = SeenPosts::default();
     let mut delay = Duration::from_secs(1);
     loop {
-        if let Err(error) = human_connection(&api, &operator.id, &deliveries).await {
+        if let Err(error) = mattermost_connection(&api, &operator.id, &deliveries, &mut seen).await
+        {
             eprintln!("wire relay: Mattermost intake disconnected: {error}");
         }
         sleep(delay).await;
@@ -316,10 +321,11 @@ async fn serve_human(
     }
 }
 
-async fn human_connection(
+async fn mattermost_connection(
     api: &Mattermost,
     operator_id: &str,
     deliveries: &mpsc::Sender<Delivery>,
+    seen: &mut SeenPosts,
 ) -> Result<(), RelayError> {
     let mut request = api
         .websocket_url()?
@@ -343,7 +349,7 @@ async fn human_connection(
                 if !armed || event.get("event").and_then(Value::as_str) != Some("posted") {
                     continue;
                 }
-                admit_human_event(api, operator_id, deliveries, &event).await?;
+                admit_event(api, operator_id, deliveries, seen, &event).await?;
             }
             Message::Ping(payload) => socket
                 .send(Message::Pong(payload))
@@ -358,10 +364,11 @@ async fn human_connection(
     ))
 }
 
-async fn admit_human_event(
+async fn admit_event(
     api: &Mattermost,
     operator_id: &str,
     deliveries: &mpsc::Sender<Delivery>,
+    seen: &mut SeenPosts,
     event: &Value,
 ) -> Result<(), RelayError> {
     let Some(post_json) = event
@@ -372,10 +379,71 @@ async fn admit_human_event(
         return Ok(());
     };
     let post: Post = serde_json::from_str(post_json)?;
-    if post.user_id != operator_id || post.message.is_empty() {
+    if post.message.is_empty() || !seen.admit(&post.id) {
         return Ok(());
     }
+    if post.user_id == operator_id {
+        return admit_human_post(api, operator_id, deliveries, post).await;
+    }
+    let Some(audience) = api.channel_audience(&post).await? else {
+        return Ok(());
+    };
+    let loaded = match appserver::loaded_sessions().await {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            eprintln!("wire relay: dropped channel post {}: {error}", post.id);
+            return Ok(());
+        }
+    };
+    let census = match Census::scan() {
+        Ok(census) => census,
+        Err(error) => {
+            eprintln!("wire relay: dropped channel post {}: {error}", post.id);
+            return Ok(());
+        }
+    };
+    let channel = format!(
+        "{}:{}",
+        audience.channel.team.name, audience.channel.channel.display_name
+    );
+    for recipient in audience.recipients {
+        if !loaded.contains(&recipient.session) {
+            continue;
+        }
+        let Some(seat) = census.seat(&recipient.session) else {
+            continue;
+        };
+        let delivery = Delivery {
+            target: recipient.session,
+            process: seat.process,
+            payload: Payload::Peer(PeerMessage {
+                post_id: post.id.clone(),
+                sender_session: audience.sender.session,
+                sender: audience.sender.username.clone(),
+                source: AdvisorySource::Channel {
+                    channel: channel.clone(),
+                },
+                body: post.message.clone(),
+            }),
+        };
+        if let Err(error) = deliveries.try_send(delivery) {
+            eprintln!(
+                "wire relay: dropped channel delivery to {}: {error}",
+                recipient.session
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn admit_human_post(
+    api: &Mattermost,
+    operator_id: &str,
+    deliveries: &mpsc::Sender<Delivery>,
+    post: Post,
+) -> Result<(), RelayError> {
     let Some(target) = api.direct_session(&post.channel_id, operator_id).await? else {
+        // Human posts in ordinary channels are deliberately inert.
         return Ok(());
     };
     let Some(process) = live_process(target)? else {
@@ -409,12 +477,37 @@ async fn dispatch(mut receiver: mpsc::Receiver<Delivery>) {
         let mut batch = vec![first];
         loop {
             match timeout_at(deadline, receiver.recv()).await {
-                Ok(Some(delivery)) if batch[0].shares_batch(&delivery) => batch.push(delivery),
+                Ok(Some(delivery))
+                    if batch.len() < MAX_BATCH_MESSAGES && batch[0].shares_batch(&delivery) =>
+                {
+                    batch.push(delivery);
+                }
                 Ok(Some(delivery)) => waiting.push_back(delivery),
                 Ok(None) | Err(_) => break,
             }
         }
         deliver(batch).await;
+    }
+}
+
+#[derive(Default)]
+struct SeenPosts {
+    ids: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl SeenPosts {
+    fn admit(&mut self, post: &str) -> bool {
+        if !self.ids.insert(post.to_owned()) {
+            return false;
+        }
+        self.order.push_back(post.to_owned());
+        if self.order.len() > RECENT_POSTS
+            && let Some(evicted) = self.order.pop_front()
+        {
+            let _removed = self.ids.remove(&evicted);
+        }
+        true
     }
 }
 

@@ -11,7 +11,7 @@ license = "MIT"
 readme = "README.md"
 repository = "https://github.com/aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/wire"
 rust-version = "1.97"
-version = "0.3.3"
+version = "0.4.0"
 
 [workspace.dependencies]
 clap = { version = "4.5", features = ["derive"] }

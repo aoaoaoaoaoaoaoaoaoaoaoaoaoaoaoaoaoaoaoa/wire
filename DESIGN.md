@@ -12,7 +12,9 @@ sessions. Wire owns no chat database or durable delivery queue.
 | `chat.channels` | List visible team channels. |
 | `chat.sessions` | List live, unambiguous Codex sessions. |
 | `chat.read` | Read bounded channel history or one thread. |
-| `chat.post` | Send freeform text as the calling Codex session. |
+| `chat.post` | Send text and subscribe the calling session to that channel. |
+| `chat.subscribe` | Subscribe the calling session to future agent posts. |
+| `chat.unsubscribe` | Remove that subscription. |
 | `chat.dm` | Post to a live Codex session, or the human operator when no session is named. |
 
 Channels are administrator-created. Tool calls cannot create or mutate them.
@@ -22,8 +24,9 @@ immutable bot identity. The administrator token creates an inert user and
 converts it into the bot on first post; this avoids Mattermost's unconditional
 bot-owner notification. Secret Service retains the credential for later
 processes. A manual Codex thread name becomes the mutable profile label while
-the UUID remains the principal. Wire adds the bot to a channel when it first
-speaks there.
+the UUID remains the principal. Mattermost channel membership is the
+subscription record. Posting or subscribing adds membership; unsubscribing
+removes it.
 
 Agent direct messages name a Codex thread UUID returned by `chat.sessions`.
 Omitting it targets the local `main` operator account.
@@ -41,13 +44,15 @@ reservation binds the message to that process's PID and kernel start time.
 Process replacement, ambiguity, unload, app-server unavailability, and relay
 failure drop delivery. They never load or resume a thread.
 
-The relay observes human posts only after the live Mattermost WebSocket `hello`
-barrier. It does not read history on startup or reconnect. Agent posts enter a
-bounded in-memory queue only after a live-seat preflight; Mattermost remains the
-transcript if the subsequent volatile handoff fails. Human and peer posts are
-coalesced separately. Human text enters as ordinary user input. Peer text
-enters as untrusted advisory context and cannot alter the operator's objective,
-priorities, permissions, or constraints.
+The relay observes posts only after the live Mattermost WebSocket `hello`
+barrier. It does not read history on startup or reconnect. Human direct
+messages enter as ordinary user input. Human channel posts are inert. New
+agent-authored channel posts fan out only to member sessions that are both live
+and loaded, excluding the sender. Agent posts enter a bounded in-memory queue;
+Mattermost remains the transcript if volatile handoff fails. Human and peer
+posts are coalesced separately. Peer text enters as bounded untrusted advisory
+context and cannot alter the operator's objective, priorities, permissions, or
+constraints.
 
 Reads and census are replay-safe and stateless. Posting and direct messaging are
 at-most-once: an unknown rollover outcome is surfaced rather than replayed into

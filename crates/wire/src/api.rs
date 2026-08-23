@@ -99,6 +99,26 @@ pub(crate) struct CreatedDirectMessage {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct ChannelSubscription {
+    pub(crate) channel: BoundChannel,
+    pub(crate) subscribed: bool,
+    pub(crate) changed: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ChannelAudience {
+    pub(crate) channel: BoundChannel,
+    pub(crate) sender: WireBot,
+    pub(crate) recipients: Vec<WireBot>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WireBot {
+    pub(crate) session: Uuid,
+    pub(crate) username: String,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct Session {
     id: Uuid,
     title: Option<String>,
@@ -109,7 +129,6 @@ struct Identity {
     user_id: String,
     token: String,
     profile: Mutex<Profile>,
-    channels: Mutex<HashSet<String>>,
 }
 
 type IdentitySlot = OnceCell<Arc<Identity>>;
@@ -381,6 +400,10 @@ impl Mattermost {
         channel_id: &str,
         operator_id: &str,
     ) -> Result<Option<Uuid>, WireError> {
+        let channel: Channel = self.get(&format!("/channels/{channel_id}")).await?;
+        if channel.kind != "D" {
+            return Ok(None);
+        }
         let members: Vec<ChannelMember> =
             self.get(&format!("/channels/{channel_id}/members")).await?;
         let mut recipients = members
@@ -500,7 +523,7 @@ impl Mattermost {
         let channel = self.resolve_channel(selector).await?;
         let identity = self.identity(session).await?;
         let sender = self.sync_profile(&identity, session).await?;
-        self.ensure_membership(&identity, &channel).await?;
+        let _subscribed = self.ensure_membership(&identity, &channel).await?;
         let post = self
             .post_json_as(
                 &identity.token,
@@ -517,6 +540,77 @@ impl Mattermost {
             post,
             sender,
         })
+    }
+
+    pub(crate) async fn subscribe(
+        &self,
+        session: &Session,
+        selector: &str,
+    ) -> Result<ChannelSubscription, WireError> {
+        let channel = self.resolve_channel(selector).await?;
+        let identity = self.identity(session).await?;
+        let _sender = self.sync_profile(&identity, session).await?;
+        let changed = self.ensure_membership(&identity, &channel).await?;
+        Ok(ChannelSubscription {
+            channel,
+            subscribed: true,
+            changed,
+        })
+    }
+
+    pub(crate) async fn unsubscribe(
+        &self,
+        session: &Session,
+        selector: &str,
+    ) -> Result<ChannelSubscription, WireError> {
+        let channel = self.resolve_channel(selector).await?;
+        let Some(bot) = self.find_bot(session).await? else {
+            return Ok(ChannelSubscription {
+                channel,
+                subscribed: false,
+                changed: false,
+            });
+        };
+        let changed = self
+            .delete_optional(&format!(
+                "/channels/{}/members/{}",
+                channel.channel.id, bot.user_id
+            ))
+            .await?;
+        Ok(ChannelSubscription {
+            channel,
+            subscribed: false,
+            changed,
+        })
+    }
+
+    pub(crate) async fn channel_audience(
+        &self,
+        post: &Post,
+    ) -> Result<Option<ChannelAudience>, WireError> {
+        let channel: Channel = self.get(&format!("/channels/{}", post.channel_id)).await?;
+        if !matches!(channel.kind.as_str(), "O" | "P") {
+            return Ok(None);
+        }
+        let bots = self.wire_bots().await?;
+        let Some(sender) = bots.get(&post.user_id).cloned() else {
+            // Human and foreign-bot channel posts are deliberately inert.
+            return Ok(None);
+        };
+        let members: Vec<ChannelMember> = self
+            .get(&format!("/channels/{}/members", channel.id))
+            .await?;
+        let recipients = members
+            .into_iter()
+            .filter(|member| member.user_id != post.user_id)
+            .filter_map(|member| bots.get(&member.user_id).cloned())
+            .collect();
+        let team: Team = self.get(&format!("/teams/{}", channel.team_id)).await?;
+        Ok(Some(ChannelAudience {
+            channel: BoundChannel { team, channel },
+            sender,
+            recipients,
+        }))
     }
 
     pub(crate) async fn direct_message(
@@ -603,7 +697,6 @@ impl Mattermost {
                         title: session.title.clone(),
                         username: bot.username,
                     }),
-                    channels: Mutex::new(HashSet::new()),
                 }))
             })
             .await?;
@@ -743,6 +836,33 @@ impl Mattermost {
         unreachable!()
     }
 
+    async fn wire_bots(&self) -> Result<HashMap<String, WireBot>, WireError> {
+        let mut indexed = HashMap::new();
+        for page in 0.. {
+            let bots: Vec<Bot> = self.get(&format!("/bots?page={page}&per_page=200")).await?;
+            let count = bots.len();
+            indexed.extend(bots.into_iter().filter_map(|bot| {
+                let session = bot
+                    .description
+                    .as_deref()?
+                    .strip_prefix("Codex session ")?
+                    .parse()
+                    .ok()?;
+                Some((
+                    bot.user_id.clone(),
+                    WireBot {
+                        session,
+                        username: bot.username,
+                    },
+                ))
+            }));
+            if count < 200 {
+                return Ok(indexed);
+            }
+        }
+        unreachable!()
+    }
+
     async fn sync_bot_profile(&self, session: &Session, bot: Bot) -> Result<Bot, WireError> {
         let display_name = session.display_name();
         let description = session.description();
@@ -853,48 +973,59 @@ impl Mattermost {
         &self,
         identity: &Identity,
         channel: &BoundChannel,
-    ) -> Result<(), WireError> {
-        let mut channels = identity.channels.lock().await;
-        if channels.contains(&channel.channel.id) {
-            return Ok(());
-        }
+    ) -> Result<bool, WireError> {
         let team_member = format!("/teams/{}/members/{}", channel.team.id, identity.user_id);
-        if self
-            .get_optional::<serde_json::Value>(&team_member)
-            .await?
-            .is_none()
-        {
-            let _: serde_json::Value = self
-                .post_json(
-                    &format!("/teams/{}/members", channel.team.id),
-                    &serde_json::json!({
-                        "team_id": channel.team.id,
-                        "user_id": identity.user_id,
-                    }),
-                )
-                .await?;
-        }
+        let _team_added = self
+            .ensure_relation(
+                &team_member,
+                &format!("/teams/{}/members", channel.team.id),
+                &serde_json::json!({
+                    "team_id": channel.team.id,
+                    "user_id": identity.user_id,
+                }),
+            )
+            .await?;
         let channel_member = format!(
             "/channels/{}/members/{}",
             channel.channel.id, identity.user_id
         );
+        self.ensure_relation(
+            &channel_member,
+            &format!("/channels/{}/members", channel.channel.id),
+            &serde_json::json!({
+                "channel_id": channel.channel.id,
+                "user_id": identity.user_id,
+            }),
+        )
+        .await
+    }
+
+    async fn ensure_relation<I: Serialize + ?Sized>(
+        &self,
+        probe: &str,
+        create: &str,
+        input: &I,
+    ) -> Result<bool, WireError> {
         if self
-            .get_optional::<serde_json::Value>(&channel_member)
+            .get_optional::<serde_json::Value>(probe)
             .await?
-            .is_none()
+            .is_some()
         {
-            let _: serde_json::Value = self
-                .post_json(
-                    &format!("/channels/{}/members", channel.channel.id),
-                    &serde_json::json!({
-                        "channel_id": channel.channel.id,
-                        "user_id": identity.user_id,
-                    }),
-                )
-                .await?;
+            return Ok(false);
         }
-        let _inserted = channels.insert(channel.channel.id.clone());
-        Ok(())
+        let created: Result<serde_json::Value, WireError> = self.post_json(create, input).await;
+        match created {
+            Ok(_) => Ok(true),
+            Err(_error)
+                if self
+                    .get_optional::<serde_json::Value>(probe)
+                    .await?
+                    .is_some() =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, WireError> {
@@ -919,6 +1050,18 @@ impl Mattermost {
         self.decode(self.checked_response(response).await?)
             .await
             .map(Some)
+    }
+
+    async fn delete_optional(&self, path: &str) -> Result<bool, WireError> {
+        let response = self
+            .request_as(&self.admin_token, reqwest::Method::DELETE, path)
+            .send()
+            .await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        let _response = self.checked_response(response).await?;
+        Ok(true)
     }
 
     async fn post_json<I: Serialize + ?Sized, O: DeserializeOwned>(

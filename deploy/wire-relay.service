@@ -1,5 +1,5 @@
 [Unit]
-Description=Best-effort Mattermost relay for live Codex sessions
+Description=Best-effort Mattermost advisory relay for live Codex sessions
 After=mcp-depot.service
 
 [Service]

@@ -21,7 +21,7 @@ enum Command {
         #[command(subcommand)]
         command: McpCommand,
     },
-    /// Relay live direct messages into live Codex sessions.
+    /// Relay live Mattermost advisories into live Codex sessions.
     Relay,
 }
 
