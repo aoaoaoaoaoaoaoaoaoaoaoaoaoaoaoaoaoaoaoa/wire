@@ -12,4 +12,5 @@ for unit in wire-relay.service wire-relay-refresh.path wire-relay-refresh.servic
 done
 
 systemctl --user daemon-reload
-systemctl --user enable --now wire-relay.service wire-relay-refresh.path
+systemctl --user enable wire-relay.service wire-relay-refresh.path
+systemctl --user restart wire-relay.service wire-relay-refresh.path
