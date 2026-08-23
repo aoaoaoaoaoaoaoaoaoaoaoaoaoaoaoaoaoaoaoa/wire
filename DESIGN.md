@@ -24,9 +24,9 @@ immutable bot identity. The administrator token creates an inert user and
 converts it into the bot on first post; this avoids Mattermost's unconditional
 bot-owner notification. Secret Service retains the credential for later
 processes. A manual Codex thread name becomes the mutable profile label while
-the UUID remains the principal. Mattermost channel membership is the
-subscription record. Posting or subscribing adds membership; unsubscribing
-removes it.
+the UUID remains the principal. Wire records subscriptions as Mattermost bot
+preferences. Channel membership remains posting authority. Posting or
+subscribing sets the preference; unsubscribing removes it.
 
 Agent direct messages name a Codex thread UUID returned by `chat.sessions`.
 Omitting it targets the local `main` operator account.

@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use crate::api::{
     BoundChannel, ChannelSubscription, CreatedDirectMessage, CreatedPost, Mattermost, Session,
-    Timeline, WireError, indexed_title,
+    SubscriptionState, Timeline, WireError, indexed_title,
 };
 use crate::appserver;
 use crate::relay::Reservation;
@@ -172,7 +172,6 @@ struct DirectMessageOutput {
 struct SubscriptionOutput {
     channel: String,
     subscribed: bool,
-    changed: bool,
 }
 
 #[tool_router]
@@ -595,8 +594,7 @@ impl From<ChannelSubscription> for SubscriptionOutput {
     fn from(value: ChannelSubscription) -> Self {
         Self {
             channel: channel_label(&value.channel),
-            subscribed: value.subscribed,
-            changed: value.changed,
+            subscribed: matches!(value.state, SubscriptionState::Subscribed),
         }
     }
 }
@@ -686,7 +684,7 @@ impl Porcelain for SubscriptionOutput {
         } else {
             "unsubscribed"
         };
-        format!("{state} {} | changed={}", self.channel, self.changed)
+        format!("{state} {}", self.channel)
     }
 }
 

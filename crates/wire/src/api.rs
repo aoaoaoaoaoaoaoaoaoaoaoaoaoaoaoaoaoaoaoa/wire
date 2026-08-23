@@ -25,6 +25,7 @@ const ERROR_BODY_LIMIT: usize = 2_000;
 const ADMIN_ACCOUNT: &str = "admin";
 const SESSION_ACCOUNT: &str = "session";
 const OPERATOR_USERNAME: &str = "main";
+const SUBSCRIPTION_CATEGORY: &str = "wire_subscription";
 
 #[derive(Clone)]
 pub(crate) struct Mattermost {
@@ -101,8 +102,13 @@ pub(crate) struct CreatedDirectMessage {
 #[derive(Clone, Debug)]
 pub(crate) struct ChannelSubscription {
     pub(crate) channel: BoundChannel,
-    pub(crate) subscribed: bool,
-    pub(crate) changed: bool,
+    pub(crate) state: SubscriptionState,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SubscriptionState {
+    Subscribed,
+    Unsubscribed,
 }
 
 #[derive(Clone, Debug)]
@@ -172,6 +178,14 @@ struct ProvisionalUser {
 #[derive(Clone, Debug, Deserialize)]
 struct ChannelMember {
     user_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct Preference {
+    user_id: String,
+    category: String,
+    name: String,
+    value: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -523,7 +537,13 @@ impl Mattermost {
         let channel = self.resolve_channel(selector).await?;
         let identity = self.identity(session).await?;
         let sender = self.sync_profile(&identity, session).await?;
-        let _subscribed = self.ensure_membership(&identity, &channel).await?;
+        let _member_added = self.ensure_membership(&identity, &channel).await?;
+        self.set_subscription(
+            &identity.user_id,
+            &channel.channel.id,
+            SubscriptionState::Subscribed,
+        )
+        .await?;
         let post = self
             .post_json_as(
                 &identity.token,
@@ -550,11 +570,16 @@ impl Mattermost {
         let channel = self.resolve_channel(selector).await?;
         let identity = self.identity(session).await?;
         let _sender = self.sync_profile(&identity, session).await?;
-        let changed = self.ensure_membership(&identity, &channel).await?;
+        let _member_added = self.ensure_membership(&identity, &channel).await?;
+        self.set_subscription(
+            &identity.user_id,
+            &channel.channel.id,
+            SubscriptionState::Subscribed,
+        )
+        .await?;
         Ok(ChannelSubscription {
             channel,
-            subscribed: true,
-            changed,
+            state: SubscriptionState::Subscribed,
         })
     }
 
@@ -567,20 +592,18 @@ impl Mattermost {
         let Some(bot) = self.find_bot(session).await? else {
             return Ok(ChannelSubscription {
                 channel,
-                subscribed: false,
-                changed: false,
+                state: SubscriptionState::Unsubscribed,
             });
         };
-        let changed = self
-            .delete_optional(&format!(
-                "/channels/{}/members/{}",
-                channel.channel.id, bot.user_id
-            ))
-            .await?;
+        self.set_subscription(
+            &bot.user_id,
+            &channel.channel.id,
+            SubscriptionState::Unsubscribed,
+        )
+        .await?;
         Ok(ChannelSubscription {
             channel,
-            subscribed: false,
-            changed,
+            state: SubscriptionState::Unsubscribed,
         })
     }
 
@@ -600,11 +623,22 @@ impl Mattermost {
         let members: Vec<ChannelMember> = self
             .get(&format!("/channels/{}/members", channel.id))
             .await?;
-        let recipients = members
+        let mut recipients = Vec::new();
+        for member in members
             .into_iter()
             .filter(|member| member.user_id != post.user_id)
-            .filter_map(|member| bots.get(&member.user_id).cloned())
-            .collect();
+        {
+            let Some(bot) = bots.get(&member.user_id) else {
+                continue;
+            };
+            if self
+                .subscription(&member.user_id, &channel.id)
+                .await?
+                .is_some()
+            {
+                recipients.push(bot.clone());
+            }
+        }
         let team: Team = self.get(&format!("/teams/{}", channel.team_id)).await?;
         Ok(Some(ChannelAudience {
             channel: BoundChannel { team, channel },
@@ -1000,6 +1034,43 @@ impl Mattermost {
         .await
     }
 
+    async fn set_subscription(
+        &self,
+        user_id: &str,
+        channel_id: &str,
+        state: SubscriptionState,
+    ) -> Result<(), WireError> {
+        let preference = Preference::subscription(user_id, channel_id);
+        let _: serde_json::Value = match state {
+            SubscriptionState::Subscribed => {
+                self.put_json(&format!("/users/{user_id}/preferences"), &[preference])
+                    .await?
+            }
+            SubscriptionState::Unsubscribed => {
+                self.post_json(
+                    &format!("/users/{user_id}/preferences/delete"),
+                    &[preference],
+                )
+                .await?
+            }
+        };
+        Ok(())
+    }
+
+    async fn subscription(
+        &self,
+        user_id: &str,
+        channel_id: &str,
+    ) -> Result<Option<Preference>, WireError> {
+        self.get_optional(&format!(
+            "/users/{user_id}/preferences/{SUBSCRIPTION_CATEGORY}/name/{channel_id}"
+        ))
+        .await
+        .map(|preference: Option<Preference>| {
+            preference.filter(|preference| preference.value == "1")
+        })
+    }
+
     async fn ensure_relation<I: Serialize + ?Sized>(
         &self,
         probe: &str,
@@ -1050,18 +1121,6 @@ impl Mattermost {
         self.decode(self.checked_response(response).await?)
             .await
             .map(Some)
-    }
-
-    async fn delete_optional(&self, path: &str) -> Result<bool, WireError> {
-        let response = self
-            .request_as(&self.admin_token, reqwest::Method::DELETE, path)
-            .send()
-            .await?;
-        if response.status() == StatusCode::NOT_FOUND {
-            return Ok(false);
-        }
-        let _response = self.checked_response(response).await?;
-        Ok(true)
     }
 
     async fn post_json<I: Serialize + ?Sized, O: DeserializeOwned>(
@@ -1130,6 +1189,17 @@ impl Mattermost {
     ) -> Result<T, WireError> {
         let bytes = response.bytes().await?;
         Ok(serde_json::from_slice(&bytes)?)
+    }
+}
+
+impl Preference {
+    fn subscription(user_id: &str, channel_id: &str) -> Self {
+        Self {
+            user_id: user_id.to_owned(),
+            category: SUBSCRIPTION_CATEGORY.to_owned(),
+            name: channel_id.to_owned(),
+            value: "1".to_owned(),
+        }
     }
 }
 
