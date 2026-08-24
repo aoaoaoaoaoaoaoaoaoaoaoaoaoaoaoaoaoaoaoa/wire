@@ -1,5 +1,6 @@
 mod api;
 mod appserver;
+mod config;
 mod relay;
 mod server;
 

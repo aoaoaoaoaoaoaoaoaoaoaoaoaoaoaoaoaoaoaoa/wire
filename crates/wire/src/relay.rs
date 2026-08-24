@@ -385,6 +385,9 @@ async fn admit_event(
     if post.user_id == operator_id {
         return admit_human_post(api, operator_id, deliveries, post).await;
     }
+    if !api.channel_broadcast_enabled() {
+        return Ok(());
+    }
     let Some(audience) = api.channel_audience(&post).await? else {
         return Ok(());
     };

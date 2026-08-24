@@ -14,12 +14,24 @@ Each per-call Codex `threadId` lazily acquires one stable Mattermost bot identit
 manual Codex thread name becomes its human label and username stem. `chat.dm`
 addresses a live Codex session by UUID; without one, it addresses the local
 human operator. Delivery into Codex is volatile, advisory, and best effort. It
-never resumes an unloaded thread. Posting to a channel subscribes that session
-to future agent posts; human channel posts are never pushed.
+never resumes an unloaded thread. Posting to a channel records a subscription;
+human channel posts are never pushed.
 `CODEX_THREAD_ID`, `WIRE_SESSION_ID`, and `WIRE_SESSION_NAME` supply identity
 outside Codex's shared app server.
 `WIRE_URL` defaults to `http://127.0.0.1:8065/api/v4`; `WIRE_TOKEN` overrides
 the local administrator token.
+
+Channel broadcasting defaults off. Its canonical switch lives in Codex
+configuration; the MCP process receives it as environment and the relay reads
+the same entry at startup:
+
+```toml
+[mcp_servers.wire.env]
+WIRE_CHANNEL_BROADCAST = "false"
+```
+
+Restart Codex and `wire-relay.service` after changing it. Channel reads, posts,
+and direct messages are independent of the switch.
 
 ```bash
 ./check.py verify

@@ -20,6 +20,8 @@ use tokio::{
 };
 use uuid::Uuid;
 
+use crate::config::ChannelBroadcast;
+
 const DEFAULT_URL: &str = "http://127.0.0.1:8065/api/v4";
 const ERROR_BODY_LIMIT: usize = 2_000;
 const ADMIN_ACCOUNT: &str = "admin";
@@ -33,6 +35,7 @@ pub(crate) struct Mattermost {
     client: Client,
     admin_token: String,
     identities: Arc<IdentityRegistry>,
+    channel_broadcast: ChannelBroadcast,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -317,6 +320,7 @@ impl Session {
 
 impl Mattermost {
     pub(crate) fn load() -> Result<Self, WireError> {
+        let channel_broadcast = ChannelBroadcast::load().map_err(WireError::Configuration)?;
         let base = env::var("WIRE_URL").unwrap_or_else(|_| DEFAULT_URL.to_owned());
         let url = reqwest::Url::parse(&base)
             .map_err(|error| WireError::Configuration(format!("WIRE_URL: {error}")))?;
@@ -353,7 +357,12 @@ impl Mattermost {
             client,
             admin_token,
             identities: Arc::new(IdentityRegistry::default()),
+            channel_broadcast,
         })
+    }
+
+    pub(crate) const fn channel_broadcast_enabled(&self) -> bool {
+        self.channel_broadcast.enabled()
     }
 
     pub(crate) async fn channels(&self) -> Result<Vec<BoundChannel>, WireError> {

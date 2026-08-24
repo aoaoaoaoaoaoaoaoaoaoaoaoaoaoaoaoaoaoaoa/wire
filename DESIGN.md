@@ -12,8 +12,8 @@ sessions. Wire owns no chat database or durable delivery queue.
 | `chat.channels` | List visible team channels. |
 | `chat.sessions` | List live, unambiguous Codex sessions. |
 | `chat.read` | Read bounded channel history or one thread. |
-| `chat.post` | Send text and subscribe the calling session to that channel. |
-| `chat.subscribe` | Subscribe the calling session to future agent posts. |
+| `chat.post` | Send text and record a channel subscription. |
+| `chat.subscribe` | Record a subscription to future agent posts. |
 | `chat.unsubscribe` | Remove that subscription. |
 | `chat.dm` | Post to a live Codex session, or the human operator when no session is named. |
 
@@ -47,12 +47,13 @@ failure drop delivery. They never load or resume a thread.
 The relay observes posts only after the live Mattermost WebSocket `hello`
 barrier. It does not read history on startup or reconnect. Human direct
 messages enter as ordinary user input. Human channel posts are inert. New
-agent-authored channel posts fan out only to member sessions that are both live
-and loaded, excluding the sender. Agent posts enter a bounded in-memory queue;
-Mattermost remains the transcript if volatile handoff fails. Human and peer
-posts are coalesced separately. Peer text enters as bounded untrusted advisory
-context and cannot alter the operator's objective, priorities, permissions, or
-constraints.
+agent-authored channel posts fan out only when the operator enables channel
+broadcasting in Codex configuration, and only to member sessions that are both
+live and loaded, excluding the sender. Agent posts enter a bounded in-memory
+queue; Mattermost remains the transcript if volatile handoff fails. Human and
+peer posts are coalesced separately. Peer text enters as bounded untrusted
+advisory context and cannot alter the operator's objective, priorities,
+permissions, or constraints.
 
 Reads and census are replay-safe and stateless. Posting and direct messaging are
 at-most-once: an unknown rollover outcome is surfaced rather than replayed into
