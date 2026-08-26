@@ -130,6 +130,7 @@ pub(crate) struct ChannelAudience {
 pub(crate) struct WireBot {
     pub(crate) session: Uuid,
     pub(crate) username: String,
+    pub(crate) established: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -463,6 +464,16 @@ impl Mattermost {
             .get_optional::<Bot>(&format!("/bots/{}", recipient.user_id))
             .await?;
         Ok(bot.and_then(|bot| bot.legacy_session()))
+    }
+
+    pub(crate) async fn established_sessions(&self) -> Result<HashSet<Uuid>, WireError> {
+        Ok(self
+            .wire_bots()
+            .await?
+            .into_values()
+            .filter(|bot| bot.established)
+            .map(|bot| bot.session)
+            .collect())
     }
 
     pub(crate) async fn resolve_channel(&self, selector: &str) -> Result<BoundChannel, WireError> {
@@ -965,11 +976,13 @@ impl Mattermost {
                     .get(&bot.user_id)
                     .copied()?
                     .or_else(|| bot.legacy_session())?;
+                let established = bot.has_biography();
                 Some((
                     bot.user_id.clone(),
                     WireBot {
                         session,
                         username: bot.username,
+                        established,
                     },
                 ))
             })
@@ -1318,10 +1331,16 @@ impl Bot {
     }
 
     fn biography(self) -> Option<String> {
-        let legacy = self.legacy_session().is_some();
-        self.description
-            .filter(|description| !description.trim().is_empty())
-            .filter(|_| !legacy)
+        let established = self.has_biography();
+        self.description.filter(|_| established)
+    }
+
+    fn has_biography(&self) -> bool {
+        self.legacy_session().is_none()
+            && self
+                .description
+                .as_deref()
+                .is_some_and(|description| !description.trim().is_empty())
     }
 }
 

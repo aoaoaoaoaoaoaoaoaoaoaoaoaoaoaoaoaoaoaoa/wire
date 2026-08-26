@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env, fs, io,
     os::unix::{
         fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _},
@@ -32,7 +32,7 @@ use uuid::Uuid;
 
 use crate::{
     api::{Mattermost, Post, WireError},
-    appserver::{self, AdvisorySource, HumanMessage, Injection, PeerMessage},
+    appserver::{self, AdvisorySource, DeliveryPermit, HumanMessage, Injection, PeerMessage},
 };
 
 const RELAY_SOCKET: &str = "wire/relay.sock";
@@ -152,6 +152,7 @@ enum Payload {
 #[derive(Clone, Debug)]
 struct Delivery {
     target: Uuid,
+    permit: DeliveryPermit,
     payload: Payload,
 }
 
@@ -164,14 +165,14 @@ impl Delivery {
     }
 
     fn shares_batch(&self, other: &Self) -> bool {
-        self.target == other.target && self.kind() == other.kind()
+        self.target == other.target && self.permit == other.permit && self.kind() == other.kind()
     }
 }
 
 pub(crate) async fn serve(api: Mattermost) -> Result<(), RelayError> {
     let (listener, _socket) = bind_socket()?;
     let (deliveries, receiver) = mpsc::channel(256);
-    let peer = serve_local(listener, deliveries.clone());
+    let peer = serve_local(api.clone(), listener, deliveries.clone());
     let mattermost = serve_mattermost(api, deliveries);
     let dispatch = dispatch(receiver);
     tokio::select! {
@@ -182,6 +183,7 @@ pub(crate) async fn serve(api: Mattermost) -> Result<(), RelayError> {
 }
 
 async fn serve_local(
+    api: Mattermost,
     listener: UnixListener,
     deliveries: mpsc::Sender<Delivery>,
 ) -> Result<(), RelayError> {
@@ -192,10 +194,11 @@ async fn serve_local(
             .await
             .map_err(|error| RelayError::Protocol(error.to_string()))?;
         let (stream, _address) = listener.accept().await?;
+        let api = api.clone();
         let deliveries = deliveries.clone();
         let _task = tokio::spawn(async move {
             let _permit = permit;
-            if let Err(error) = handle_local(stream, deliveries).await {
+            if let Err(error) = handle_local(&api, stream, deliveries).await {
                 eprintln!("wire relay: {error}");
             }
         });
@@ -203,6 +206,7 @@ async fn serve_local(
 }
 
 async fn handle_local(
+    api: &Mattermost,
     stream: UnixStream,
     deliveries: mpsc::Sender<Delivery>,
 ) -> Result<(), RelayError> {
@@ -213,10 +217,20 @@ async fn handle_local(
             return write_protocol_error(&mut stream, "reservation required").await;
         }
     };
-    match appserver::accepts_delivery(target).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return write_protocol_error(&mut stream, "that Codex session is not ready for Wire")
+    let established = match api.established_sessions().await {
+        Ok(sessions) => sessions.contains(&target),
+        Err(error) => {
+            return write_protocol_error(
+                &mut stream,
+                &format!("Wire identity discovery failed: {error}"),
+            )
+            .await;
+        }
+    };
+    let permit = match appserver::admit_peer(target, established).await {
+        Ok(Some(permit)) => permit,
+        Ok(None) => {
+            return write_protocol_error(&mut stream, "that Codex session cannot accept Wire")
                 .await;
         }
         Err(error) => {
@@ -226,7 +240,7 @@ async fn handle_local(
             )
             .await;
         }
-    }
+    };
     write_frame(&mut stream, &LocalResponse::Ready).await?;
     let request = timeout(
         RESERVATION_TIMEOUT,
@@ -250,6 +264,7 @@ async fn handle_local(
     deliveries
         .send(Delivery {
             target,
+            permit,
             payload: Payload::Peer(PeerMessage {
                 post_id,
                 sender_session,
@@ -350,11 +365,17 @@ async fn admit_event(
     let Some(audience) = api.channel_audience(&post).await? else {
         return Ok(());
     };
-    let targets = match appserver::delivery_targets().await {
+    let established = audience
+        .recipients
+        .iter()
+        .filter(|recipient| recipient.established)
+        .map(|recipient| recipient.session)
+        .collect();
+    let targets = match appserver::delivery_targets(&established).await {
         Ok(targets) => targets
             .into_iter()
-            .map(|target| target.id)
-            .collect::<HashSet<_>>(),
+            .map(|target| (target.id, target.permit))
+            .collect::<HashMap<_, _>>(),
         Err(error) => {
             eprintln!("wire relay: dropped channel post {}: {error}", post.id);
             return Ok(());
@@ -365,11 +386,12 @@ async fn admit_event(
         audience.channel.team.name, audience.channel.channel.display_name
     );
     for recipient in audience.recipients {
-        if !targets.contains(&recipient.session) {
+        let Some(permit) = targets.get(&recipient.session).copied() else {
             continue;
-        }
+        };
         let delivery = Delivery {
             target: recipient.session,
+            permit,
             payload: Payload::Peer(PeerMessage {
                 post_id: post.id.clone(),
                 sender_session: audience.sender.session,
@@ -400,17 +422,19 @@ async fn admit_human_post(
         // Human posts in ordinary channels are deliberately inert.
         return Ok(());
     };
-    match appserver::accepts_delivery(target).await {
-        Ok(true) => {}
-        Ok(false) => return Ok(()),
+    let established = api.established_sessions().await?.contains(&target);
+    let permit = match appserver::admit_human(target, established).await {
+        Ok(Some(permit)) => permit,
+        Ok(None) => return Ok(()),
         Err(error) => {
             eprintln!("wire relay: dropped human delivery to {target}: {error}");
             return Ok(());
         }
-    }
+    };
     let _accepted = deliveries
         .send(Delivery {
             target,
+            permit,
             payload: Payload::Human(HumanMessage {
                 post_id: post.id,
                 body: post.message,
@@ -471,6 +495,7 @@ impl SeenPosts {
 
 async fn deliver(batch: Vec<Delivery>) {
     let target = batch[0].target;
+    let permit = batch[0].permit;
     let injection = match batch[0].kind() {
         Kind::Human => Injection::Human(
             batch
@@ -491,7 +516,7 @@ async fn deliver(batch: Vec<Delivery>) {
                 .collect(),
         ),
     };
-    if let Err(error) = appserver::inject(target, injection).await {
+    if let Err(error) = appserver::inject(target, injection, permit).await {
         eprintln!("wire relay: dropped delivery to {target}: {error}");
     }
 }
