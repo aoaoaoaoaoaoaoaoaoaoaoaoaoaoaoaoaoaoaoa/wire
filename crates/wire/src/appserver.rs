@@ -79,6 +79,16 @@ pub(crate) async fn loaded_sessions() -> Result<BTreeSet<SessionId>, AppServerEr
     connect().await?.loaded_sessions().await
 }
 
+pub(crate) async fn mcp_status(session: SessionId) -> Result<Value, AppServerError> {
+    connect()
+        .await?
+        .request(
+            "mcpServerStatus/list",
+            json!({"threadId": session, "detail": "toolsAndAuthOnly"}),
+        )
+        .await
+}
+
 pub(crate) async fn forge_identity(
     session: SessionId,
     prompt: &str,
@@ -182,6 +192,14 @@ pub(crate) async fn handoff(session: SessionId, message: &str) -> Result<(), App
         }
         let _reloaded = client
             .request("config/mcpServer/reload", Value::Null)
+            .await?;
+        client
+            .wait_for_tool(
+                session,
+                "wire",
+                env!("CARGO_PKG_VERSION"),
+                "identity.update",
+            )
             .await?;
         let _resumed = client
             .request(
@@ -362,6 +380,39 @@ impl Client {
             .filter_map(Value::as_str)
             .filter_map(|id| SessionId::parse_str(id).ok())
             .collect())
+    }
+
+    async fn wait_for_tool(
+        &mut self,
+        session: SessionId,
+        server: &str,
+        version: &str,
+        tool: &str,
+    ) -> Result<(), AppServerError> {
+        loop {
+            let status = self
+                .request(
+                    "mcpServerStatus/list",
+                    json!({"threadId": session, "detail": "toolsAndAuthOnly"}),
+                )
+                .await?;
+            if status
+                .get("data")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find(|entry| entry.get("name").and_then(Value::as_str) == Some(server))
+                .filter(|entry| {
+                    entry.pointer("/serverInfo/version").and_then(Value::as_str) == Some(version)
+                })
+                .and_then(|entry| entry.get("tools"))
+                .and_then(|tools| tools.get(tool))
+                .is_some()
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     async fn request(&mut self, method: &str, params: Value) -> Result<Value, AppServerError> {

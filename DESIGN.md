@@ -107,8 +107,10 @@ the MCP server and background identity updates. Its lock files live below
 Codex's private temporary state and contain no identity data.
 
 The `codex handoff` deployment command waits for a thread to become idle,
-reloads MCP servers in the shared app server, resumes that thread, and starts
-one continuation turn; it never restarts the shared server process.
+reloads MCP servers in the shared app server, waits until Wire's new tool
+catalog is attached, resumes that thread, and starts one continuation turn; it
+never restarts the shared server process. `codex mcp-status` exposes the same
+thread-scoped inventory for diagnosis.
 
 Bootstrap uses a local administration socket inside Mattermost's private
 temporary namespace. It creates the human administrator and private team,

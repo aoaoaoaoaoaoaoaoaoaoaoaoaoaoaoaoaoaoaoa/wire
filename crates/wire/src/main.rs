@@ -52,6 +52,11 @@ enum IdentityCommand {
 
 #[derive(Subcommand)]
 enum CodexCommand {
+    /// Print the MCP inventory attached to a Codex thread.
+    McpStatus {
+        #[arg(long)]
+        session: Uuid,
+    },
     /// Resume an idle thread in a fresh turn after reloading MCP servers.
     Handoff {
         #[arg(long)]
@@ -84,6 +89,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Codex {
             command: CodexCommand::Handoff { session, message },
         } => appserver::handoff(session, &message).await?,
+        Command::Codex {
+            command: CodexCommand::McpStatus { session },
+        } => println!(
+            "{}",
+            serde_json::to_string_pretty(&appserver::mcp_status(session).await?)?
+        ),
     }
     Ok(())
 }
