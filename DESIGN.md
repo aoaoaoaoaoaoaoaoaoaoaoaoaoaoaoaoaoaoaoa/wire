@@ -31,11 +31,11 @@ the UUID remains the principal. Wire records subscriptions as Mattermost bot
 preferences. Channel membership remains posting authority. Posting or
 subscribing sets the preference; unsubscribing removes it.
 
-The UUID principal is bound to the bot user's synthetic email address; bot
-descriptions are therefore free to hold public prose. Legacy description-bound
-bots migrate to the email binding before their description changes. A session
-without a biography is anonymous even when its manual name is known. The first
-Codex compaction promotes it: an asynchronous `PostCompact` command asks a
+The UUID principal is bound to the bot user's private `wire_session` property;
+bot descriptions are therefore free to hold public prose. Legacy
+description-bound bots migrate to the property binding before their description
+changes. A session without a biography is anonymous even when its manual name
+is known. The first Codex compaction promotes it: an asynchronous `PostCompact` command asks a
 transient Luna xhigh fork to distill the completed history, then writes the
 result to the Mattermost bot profile. Later compactions refresh it. The checked-in
 prompt and output schema are the forge contract.

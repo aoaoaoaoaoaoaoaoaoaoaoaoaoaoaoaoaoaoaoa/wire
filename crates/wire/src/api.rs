@@ -28,6 +28,7 @@ const ADMIN_ACCOUNT: &str = "admin";
 const SESSION_ACCOUNT: &str = "session";
 const OPERATOR_USERNAME: &str = "main";
 const SUBSCRIPTION_CATEGORY: &str = "wire_subscription";
+const SESSION_PROPERTY: &str = "wire_session";
 
 #[derive(Clone)]
 pub(crate) struct Mattermost {
@@ -43,7 +44,9 @@ pub(crate) struct User {
     pub(crate) id: String,
     pub(crate) username: String,
     #[serde(default)]
-    pub(crate) email: String,
+    props: Option<HashMap<String, String>>,
+    #[serde(default)]
+    delete_at: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -185,6 +188,8 @@ struct Bot {
 struct ProvisionalUser {
     id: String,
     email: String,
+    #[serde(default)]
+    props: Option<HashMap<String, String>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -281,10 +286,6 @@ impl Session {
             Ok(Self { id, title })
         })
         .transpose()
-    }
-
-    fn legacy_description(&self) -> String {
-        format!("Codex session {}", self.id)
     }
 
     pub(crate) fn name(&self) -> String {
@@ -452,7 +453,10 @@ impl Mattermost {
             return Ok(None);
         }
         let user: User = self.get(&format!("/users/{}", recipient.user_id)).await?;
-        if let Some(session) = session_from_email(&user.email) {
+        if user.delete_at != 0 {
+            return Ok(None);
+        }
+        if let Some(session) = session_from_properties(user.props.as_ref()) {
             return Ok(Some(session));
         }
         let bot = self
@@ -843,7 +847,9 @@ impl Mattermost {
                     Err(error) => return Err(error),
                 },
             };
-            if provisional.email != email {
+            if provisional.email != email
+                && session_from_properties(provisional.props.as_ref()) != Some(session.id)
+            {
                 continue;
             }
             return self.convert_provisional_user(session, &provisional).await;
@@ -866,6 +872,7 @@ impl Mattermost {
                 "email": email,
                 "password": format!("wire-{}", Uuid::new_v4().simple()),
                 "first_name": session.display_name(),
+                "props": {(SESSION_PROPERTY): session.id},
                 "email_verified": true,
                 "disable_welcome_email": true,
             }),
@@ -909,42 +916,32 @@ impl Mattermost {
     }
 
     async fn find_bot(&self, session: &Session) -> Result<Option<Bot>, WireError> {
-        if let Some(user) = self
-            .get_optional::<User>(&format!("/users/email/{}", session.provisional_email()))
-            .await?
-            && let Some(bot) = self
-                .get_optional::<Bot>(&format!("/bots/{}", user.id))
-                .await?
-        {
-            return Ok(Some(bot));
+        let bots = self.bots().await?;
+        if bots.is_empty() {
+            return Ok(None);
         }
-        let description = session.legacy_description();
-        for page in 0.. {
-            let bots: Vec<Bot> = self.get(&format!("/bots?page={page}&per_page=200")).await?;
-            let count = bots.len();
-            if let Some(bot) = bots
-                .into_iter()
-                .find(|bot| bot.description.as_deref() == Some(description.as_str()))
-            {
-                return Ok(Some(bot));
-            }
-            if count < 200 {
-                return Ok(None);
-            }
-        }
-        unreachable!()
+        let user_ids = bots
+            .iter()
+            .map(|bot| bot.user_id.clone())
+            .collect::<Vec<_>>();
+        let users: Vec<User> = self.post_json("/users/ids", &user_ids).await?;
+        let principals = users
+            .into_iter()
+            .filter(|user| user.delete_at == 0)
+            .map(|user| {
+                let session = session_from_properties(user.props.as_ref());
+                (user.id, session)
+            })
+            .collect::<HashMap<_, _>>();
+        Ok(bots.into_iter().find(|bot| {
+            principals.get(&bot.user_id).is_some_and(|principal| {
+                *principal == Some(session.id) || bot.legacy_session() == Some(session.id)
+            })
+        }))
     }
 
     async fn wire_bots(&self) -> Result<HashMap<String, WireBot>, WireError> {
-        let mut bots = Vec::new();
-        for page in 0.. {
-            let page_bots: Vec<Bot> = self.get(&format!("/bots?page={page}&per_page=200")).await?;
-            let count = page_bots.len();
-            bots.extend(page_bots);
-            if count < 200 {
-                break;
-            }
-        }
+        let bots = self.bots().await?;
         if bots.is_empty() {
             return Ok(HashMap::new());
         }
@@ -955,14 +952,18 @@ impl Mattermost {
         let users: Vec<User> = self.post_json("/users/ids", &user_ids).await?;
         let principals = users
             .into_iter()
-            .filter_map(|user| session_from_email(&user.email).map(|session| (user.id, session)))
+            .filter(|user| user.delete_at == 0)
+            .map(|user| {
+                let session = session_from_properties(user.props.as_ref());
+                (user.id, session)
+            })
             .collect::<HashMap<_, _>>();
         Ok(bots
             .into_iter()
             .filter_map(|bot| {
                 let session = principals
                     .get(&bot.user_id)
-                    .copied()
+                    .copied()?
                     .or_else(|| bot.legacy_session())?;
                 Some((
                     bot.user_id.clone(),
@@ -973,6 +974,19 @@ impl Mattermost {
                 ))
             })
             .collect())
+    }
+
+    async fn bots(&self) -> Result<Vec<Bot>, WireError> {
+        let mut bots = Vec::new();
+        for page in 0.. {
+            let page_bots: Vec<Bot> = self.get(&format!("/bots?page={page}&per_page=200")).await?;
+            let count = page_bots.len();
+            bots.extend(page_bots);
+            if count < 200 {
+                return Ok(bots);
+            }
+        }
+        unreachable!()
     }
 
     async fn sync_bot_profile(&self, session: &Session, bot: Bot) -> Result<Bot, WireError> {
@@ -1014,12 +1028,14 @@ impl Mattermost {
 
     async fn bind_bot_user(&self, session: &Session, bot: &Bot) -> Result<(), WireError> {
         let user: User = self.get(&format!("/users/{}", bot.user_id)).await?;
-        let email = session.provisional_email();
-        if user.email != email {
+        let mut props = user.props.unwrap_or_default();
+        let session_id = session.id.to_string();
+        if props.get(SESSION_PROPERTY) != Some(&session_id) {
+            let _previous = props.insert(SESSION_PROPERTY.to_owned(), session_id);
             let _updated: User = self
                 .put_json(
                     &format!("/users/{}/patch", bot.user_id),
-                    &serde_json::json!({"email": email}),
+                    &serde_json::json!({"props": props}),
                 )
                 .await?;
         }
@@ -1465,11 +1481,8 @@ fn session_slug(title: &str) -> String {
     slug
 }
 
-fn session_from_email(email: &str) -> Option<Uuid> {
-    let compact = email.strip_prefix("wire-")?.strip_suffix("@localhost")?;
-    (compact.len() == 32 && compact.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .then(|| Uuid::parse_str(compact).ok())
-        .flatten()
+fn session_from_properties(properties: Option<&HashMap<String, String>>) -> Option<Uuid> {
+    properties?.get(SESSION_PROPERTY)?.parse().ok()
 }
 
 fn truncate_chars(value: &str, limit: usize) -> String {
