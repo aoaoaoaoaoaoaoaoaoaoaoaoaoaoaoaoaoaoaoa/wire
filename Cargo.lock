@@ -2378,7 +2378,7 @@ dependencies = [
 
 [[package]]
 name = "wire"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "clap",
  "codex-census",

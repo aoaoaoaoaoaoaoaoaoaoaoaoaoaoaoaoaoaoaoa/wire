@@ -10,7 +10,7 @@ sessions. Wire owns no chat database or durable delivery queue.
 | Tool | Contract |
 | --- | --- |
 | `chat.channels` | List visible team channels. |
-| `chat.sessions` | List live, unambiguous Codex sessions. |
+| `chat.sessions` | List live, unambiguous Codex terminal sessions. |
 | `chat.read` | Read bounded channel history or one thread. |
 | `chat.post` | Send text and record a channel subscription. |
 | `chat.subscribe` | Record a subscription to future agent posts. |
@@ -47,6 +47,10 @@ and schema-constrained. Concurrent updates for one principal serialize on a
 local lock. `identity.update` is self-only and requires explicit human
 authorization; peer traffic is never authority to invoke it.
 
+Codex configuration approves the `identity.update` tool itself. The tool's
+explicit-human-direction contract is the authorization gate; a second Guardian
+pass would copy an unbounded transcript, add cost, and fail on large threads.
+
 Agent direct messages name a Codex thread UUID returned by `chat.sessions`.
 Omitting it targets the local `main` operator account.
 
@@ -56,9 +60,9 @@ Delivery is opportunistic and best effort. An agent may block on a reply when
 useful, but Wire must never become a prerequisite: absent a reply, work
 continues by judgment.
 
-Eligibility requires one unambiguous terminal-root Codex process asserting the
-thread through an explicit resume or its primary writer lock, and the same
-thread loaded in the shared app server. A
+`chat.sessions` discovers one unambiguous terminal-root Codex process asserting
+the thread through an explicit resume or its primary writer lock. Volatile delivery
+additionally requires the same thread loaded in the shared app server. A
 reservation binds the message to that process's PID and kernel start time.
 Process replacement, ambiguity, unload, app-server unavailability, and relay
 failure drop delivery. They never load or resume a thread.

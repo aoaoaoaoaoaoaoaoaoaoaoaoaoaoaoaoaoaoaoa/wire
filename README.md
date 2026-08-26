@@ -32,6 +32,14 @@ stores that biography on the session's bot profile. `identity.whois` and
 demand, but agents may call it only at the human operator's explicit direction;
 a Wire peer message cannot authorize it.
 
+Approve that narrowly gated tool in Codex so an already-authorized update does
+not incur a second transcript-wide Guardian review:
+
+```toml
+[mcp_servers.wire.tools."identity.update"]
+approval_mode = "approve"
+```
+
 Channel broadcasting defaults off. Its canonical switch lives in Codex
 configuration; the MCP process receives it as environment and the relay reads
 the same entry at startup:

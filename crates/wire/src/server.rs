@@ -21,7 +21,6 @@ use crate::api::{
     AgentIdentity, BoundChannel, ChannelSubscription, CreatedDirectMessage, CreatedPost,
     Mattermost, Session, SubscriptionState, Timeline, WireError, indexed_title,
 };
-use crate::appserver;
 use crate::identity;
 use crate::relay::Reservation;
 
@@ -254,7 +253,7 @@ impl WireServer {
 
     #[tool(
         name = "chat.sessions",
-        description = "List unambiguous live Codex sessions eligible for best-effort direct messages.",
+        description = "List unambiguous live Codex sessions available as direct-message recipients.",
         annotations(
             title = "List live Codex sessions",
             read_only_hint = true,
@@ -276,17 +275,8 @@ impl WireServer {
                 ))]));
             }
         };
-        let loaded = match appserver::loaded_sessions().await {
-            Ok(sessions) => sessions,
-            Err(error) => {
-                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                    "shared Codex app server failed: {error}"
-                ))]));
-            }
-        };
         let sessions = census
             .seats()
-            .filter(|seat| loaded.contains(&seat.session))
             .map(|seat| SessionOutput {
                 id: seat.session,
                 name: indexed_title(seat.session),
