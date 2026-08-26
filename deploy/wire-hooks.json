@@ -1,0 +1,18 @@
+{
+  "description": "Maintain mature Wire agent identities after Codex compaction.",
+  "hooks": {
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${HOME}/.local/libexec/wire-current\" identity update-hook",
+            "async": true,
+            "timeout": 240,
+            "statusMessage": "Updating Wire identity"
+          }
+        ]
+      }
+    ]
+  }
+}

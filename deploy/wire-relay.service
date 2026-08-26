@@ -4,7 +4,7 @@ After=mcp-depot.service
 
 [Service]
 Type=simple
-ExecStart=%h/.local/libexec/wire-relay
+ExecStart=%h/.local/libexec/wire-current relay
 Restart=on-failure
 RestartSec=3s
 TimeoutStopSec=10s

@@ -1,12 +1,14 @@
 mod api;
 mod appserver;
 mod config;
+mod identity;
 mod relay;
 mod server;
 
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use uuid::Uuid;
 
 #[derive(Parser)]
 #[command(author, version, about = "Mattermost chat for Codex agents")]
@@ -24,12 +26,39 @@ enum Command {
     },
     /// Relay live Mattermost advisories into live Codex sessions.
     Relay,
+    /// Maintain public Codex session identities.
+    Identity {
+        #[command(subcommand)]
+        command: IdentityCommand,
+    },
+    /// Operate the shared Codex app server.
+    Codex {
+        #[command(subcommand)]
+        command: CodexCommand,
+    },
 }
 
 #[derive(Subcommand)]
 enum McpCommand {
     /// Run the ordinary stdio MCP server.
     Serve,
+}
+
+#[derive(Subcommand)]
+enum IdentityCommand {
+    /// Consume one Codex `PostCompact` hook event from standard input.
+    UpdateHook,
+}
+
+#[derive(Subcommand)]
+enum CodexCommand {
+    /// Resume an idle thread in a fresh turn after reloading MCP servers.
+    Handoff {
+        #[arg(long)]
+        session: Uuid,
+        #[arg(long)]
+        message: String,
+    },
 }
 
 #[tokio::main]
@@ -49,6 +78,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             command: McpCommand::Serve,
         } => server::serve(api::Mattermost::load()?).await?,
         Command::Relay => Box::pin(relay::serve(api::Mattermost::load()?)).await?,
+        Command::Identity {
+            command: IdentityCommand::UpdateHook,
+        } => identity::update_hook(&api::Mattermost::load()?).await?,
+        Command::Codex {
+            command: CodexCommand::Handoff { session, message },
+        } => appserver::handoff(session, &message).await?,
     }
     Ok(())
 }

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     env,
     path::PathBuf,
     time::Duration,
@@ -17,7 +17,10 @@ use tokio_tungstenite::{
 
 const HANDSHAKE_URL: &str = "ws://localhost/rpc";
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
+const FORGE_TIMEOUT: Duration = Duration::from_secs(180);
+const HANDOFF_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_ADVISORY_CHARS: usize = 2_000;
+const MAX_ACTIVE_EVIDENCE_CHARS: usize = 16_000;
 
 #[derive(Clone, Debug)]
 pub(crate) struct HumanMessage {
@@ -76,6 +79,131 @@ pub(crate) async fn loaded_sessions() -> Result<BTreeSet<SessionId>, AppServerEr
     connect().await?.loaded_sessions().await
 }
 
+pub(crate) async fn forge_identity(
+    session: SessionId,
+    prompt: &str,
+    output_schema: Value,
+) -> Result<String, AppServerError> {
+    let mut client = connect().await?;
+    let source = client
+        .request(
+            "thread/read",
+            json!({"threadId": session, "includeTurns": true}),
+        )
+        .await?;
+    let active_turn = source
+        .pointer("/thread/turns")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .rev()
+        .find(|turn| turn.get("status").and_then(Value::as_str) == Some("inProgress"));
+    let active_turn_id = active_turn
+        .and_then(|turn| turn.get("id"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let active_evidence = active_turn.map(active_user_evidence).unwrap_or_default();
+    let prompt = if active_evidence.is_empty() {
+        prompt.to_owned()
+    } else {
+        format!(
+            "{prompt}\n\n# Current In-Progress Operator Requests\n\n{}",
+            json!(active_evidence)
+        )
+    };
+
+    let mut fork_params = json!({
+        "threadId": session,
+        "ephemeral": true,
+        "excludeTurns": true,
+        "model": "gpt-5.6-luna",
+        "serviceTier": "priority",
+        "approvalPolicy": "never",
+        "sandbox": "read-only",
+        "developerInstructions": "You are a read-only biographer. Follow the identity brief in the next operator message exactly. Do not continue the source thread's work, call tools, edit files, or communicate with anyone."
+    });
+    if let Some(turn_id) = active_turn_id {
+        fork_params["beforeTurnId"] = Value::String(turn_id);
+    }
+    let forked = client.request("thread/fork", fork_params).await?;
+    let thread_id = required_string(&forked, "/thread/id", "forked thread id")?;
+    let started = client
+        .request(
+            "turn/start",
+            json!({
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": prompt, "textElements": []}],
+                "model": "gpt-5.6-luna",
+                "effort": "xhigh",
+                "serviceTier": "priority",
+                "approvalPolicy": "never",
+                "sandboxPolicy": {"type": "readOnly", "networkAccess": false},
+                "outputSchema": output_schema
+            }),
+        )
+        .await?;
+    let turn_id = required_string(&started, "/turn/id", "identity turn id")?;
+    let result = timeout(
+        FORGE_TIMEOUT,
+        client.completed_agent_message(&thread_id, &turn_id),
+    )
+    .await
+    .map_err(|_| AppServerError::Control("identity forge timed out".to_owned()))?;
+    let _unsubscribed = client
+        .request("thread/unsubscribe", json!({"threadId": thread_id}))
+        .await;
+    result
+}
+
+pub(crate) async fn handoff(session: SessionId, message: &str) -> Result<(), AppServerError> {
+    let mut client = connect().await?;
+    timeout(HANDOFF_TIMEOUT, async {
+        loop {
+            let thread = client
+                .request("thread/read", json!({"threadId": session}))
+                .await?;
+            match thread
+                .pointer("/thread/status/type")
+                .and_then(Value::as_str)
+            {
+                Some("idle") => break,
+                Some("active") => tokio::time::sleep(Duration::from_millis(250)).await,
+                Some(status) => {
+                    return Err(AppServerError::Control(format!(
+                        "cannot hand off a thread in {status} state"
+                    )));
+                }
+                None => {
+                    return Err(AppServerError::Control(
+                        "thread/read omitted thread status".to_owned(),
+                    ));
+                }
+            }
+        }
+        let _reloaded = client
+            .request("config/mcpServer/reload", Value::Null)
+            .await?;
+        let _resumed = client
+            .request(
+                "thread/resume",
+                json!({"threadId": session, "excludeTurns": true}),
+            )
+            .await?;
+        let _started = client
+            .request(
+                "turn/start",
+                json!({
+                    "threadId": session,
+                    "input": [{"type": "text", "text": message, "textElements": []}]
+                }),
+            )
+            .await?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| AppServerError::Control("thread handoff timed out".to_owned()))?
+}
+
 async fn connect() -> Result<Client, AppServerError> {
     let socket = control_socket();
     let stream = timeout(RPC_TIMEOUT, UnixStream::connect(&socket))
@@ -89,7 +217,11 @@ async fn connect() -> Result<Client, AppServerError> {
         .await
         .map_err(|_| AppServerError::Control("websocket upgrade timed out".to_owned()))?
         .map_err(control)?;
-    let mut client = Client { stream, next_id: 1 };
+    let mut client = Client {
+        stream,
+        next_id: 1,
+        inbox: VecDeque::new(),
+    };
     let _initialized = client
         .request(
             "initialize",
@@ -187,9 +319,36 @@ fn bounded_advisory(body: &str) -> String {
     bounded
 }
 
+fn active_user_evidence(turn: &Value) -> Vec<String> {
+    let mut remaining = MAX_ACTIVE_EVIDENCE_CHARS;
+    turn.get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("userMessage"))
+        .flat_map(|item| {
+            item.get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter(|content| content.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|content| content.get("text").and_then(Value::as_str))
+        .filter_map(|text| {
+            if remaining == 0 {
+                return None;
+            }
+            let excerpt = text.chars().take(remaining).collect::<String>();
+            remaining -= excerpt.chars().count();
+            (!excerpt.is_empty()).then_some(excerpt)
+        })
+        .collect()
+}
+
 struct Client {
     stream: WebSocketStream<UnixStream>,
     next_id: i64,
+    inbox: VecDeque<Value>,
 }
 
 impl Client {
@@ -227,6 +386,7 @@ impl Client {
                 Message::Text(text) => {
                     let message: Value = serde_json::from_str(&text).map_err(control)?;
                     if message.get("id").and_then(Value::as_i64) != Some(id) {
+                        self.inbox.push_back(message);
                         continue;
                     }
                     if let Some(result) = message.get("result") {
@@ -254,6 +414,83 @@ impl Client {
             "connection ended before response".to_owned(),
         ))
     }
+
+    async fn completed_agent_message(
+        &mut self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<String, AppServerError> {
+        let mut answer = None;
+        loop {
+            let message = self.next_notification().await?;
+            let method = message.get("method").and_then(Value::as_str);
+            let params = &message["params"];
+            if params.get("threadId").and_then(Value::as_str) != Some(thread_id)
+                || params
+                    .get("turnId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id != turn_id)
+            {
+                continue;
+            }
+            if method == Some("item/completed")
+                && params.pointer("/item/type").and_then(Value::as_str) == Some("agentMessage")
+            {
+                answer = params
+                    .pointer("/item/text")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+            }
+            if method == Some("turn/completed") {
+                let status = params.pointer("/turn/status").and_then(Value::as_str);
+                if status != Some("completed") {
+                    let error = params
+                        .pointer("/turn/error/message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("identity turn did not complete");
+                    return Err(AppServerError::Control(error.to_owned()));
+                }
+                return answer.ok_or_else(|| {
+                    AppServerError::Control(
+                        "identity turn completed without an agent message".to_owned(),
+                    )
+                });
+            }
+        }
+    }
+
+    async fn next_notification(&mut self) -> Result<Value, AppServerError> {
+        if let Some(message) = self.inbox.pop_front() {
+            return Ok(message);
+        }
+        while let Some(frame) = self.stream.next().await {
+            match frame.map_err(control)? {
+                Message::Text(text) => return serde_json::from_str(&text).map_err(control),
+                Message::Ping(payload) => self
+                    .stream
+                    .send(Message::Pong(payload))
+                    .await
+                    .map_err(control)?,
+                Message::Close(_) => {
+                    return Err(AppServerError::Control(
+                        "connection closed before identity completion".to_owned(),
+                    ));
+                }
+                Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
+            }
+        }
+        Err(AppServerError::Control(
+            "connection ended before identity completion".to_owned(),
+        ))
+    }
+}
+
+fn required_string(value: &Value, pointer: &str, label: &str) -> Result<String, AppServerError> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| AppServerError::Control(format!("missing {label}")))
 }
 
 fn control_socket() -> PathBuf {

@@ -42,6 +42,8 @@ pub(crate) struct Mattermost {
 pub(crate) struct User {
     pub(crate) id: String,
     pub(crate) username: String,
+    #[serde(default)]
+    pub(crate) email: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -125,6 +127,13 @@ pub(crate) struct ChannelAudience {
 pub(crate) struct WireBot {
     pub(crate) session: Uuid,
     pub(crate) username: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AgentIdentity {
+    pub(crate) session: Uuid,
+    pub(crate) name: String,
+    pub(crate) biography: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -246,7 +255,7 @@ impl Session {
         })
     }
 
-    fn for_id(id: Uuid) -> Self {
+    pub(crate) fn for_id(id: Uuid) -> Self {
         Self {
             id,
             title: indexed_title(id),
@@ -274,8 +283,12 @@ impl Session {
         .transpose()
     }
 
-    fn description(&self) -> String {
+    fn legacy_description(&self) -> String {
         format!("Codex session {}", self.id)
+    }
+
+    pub(crate) fn name(&self) -> String {
+        self.title.clone().unwrap_or_else(|| self.display_name())
     }
 
     fn provisional_email(&self) -> String {
@@ -438,17 +451,14 @@ impl Mattermost {
         if recipients.next().is_some() {
             return Ok(None);
         }
+        let user: User = self.get(&format!("/users/{}", recipient.user_id)).await?;
+        if let Some(session) = session_from_email(&user.email) {
+            return Ok(Some(session));
+        }
         let bot = self
             .get_optional::<Bot>(&format!("/bots/{}", recipient.user_id))
             .await?;
-        Ok(bot
-            .and_then(|bot| bot.description)
-            .and_then(|description| {
-                description
-                    .strip_prefix("Codex session ")
-                    .map(str::to_owned)
-            })
-            .and_then(|id| Uuid::parse_str(&id).ok()))
+        Ok(bot.and_then(|bot| bot.legacy_session()))
     }
 
     pub(crate) async fn resolve_channel(&self, selector: &str) -> Result<BoundChannel, WireError> {
@@ -727,6 +737,43 @@ impl Mattermost {
         })
     }
 
+    pub(crate) async fn agent_identity(
+        &self,
+        session: &Session,
+    ) -> Result<AgentIdentity, WireError> {
+        let biography = self.find_bot(session).await?.and_then(Bot::biography);
+        Ok(AgentIdentity {
+            session: session.id,
+            name: session.name(),
+            biography,
+        })
+    }
+
+    pub(crate) async fn publish_biography(
+        &self,
+        session: &Session,
+        biography: &str,
+    ) -> Result<AgentIdentity, WireError> {
+        let identity = self.identity(session).await?;
+        let _username = self.sync_profile(&identity, session).await?;
+        let bot: Bot = self.get(&format!("/bots/{}", identity.user_id)).await?;
+        let updated: Bot = self
+            .put_json(
+                &format!("/bots/{}", identity.user_id),
+                &serde_json::json!({
+                    "username": bot.username,
+                    "display_name": session.display_name(),
+                    "description": biography,
+                }),
+            )
+            .await?;
+        Ok(AgentIdentity {
+            session: session.id,
+            name: session.name(),
+            biography: updated.biography(),
+        })
+    }
+
     async fn identity(&self, session: &Session) -> Result<Arc<Identity>, WireError> {
         let slot = self.identities.slot(session.id).await;
         let identity = slot
@@ -862,7 +909,16 @@ impl Mattermost {
     }
 
     async fn find_bot(&self, session: &Session) -> Result<Option<Bot>, WireError> {
-        let description = session.description();
+        if let Some(user) = self
+            .get_optional::<User>(&format!("/users/email/{}", session.provisional_email()))
+            .await?
+            && let Some(bot) = self
+                .get_optional::<Bot>(&format!("/bots/{}", user.id))
+                .await?
+        {
+            return Ok(Some(bot));
+        }
+        let description = session.legacy_description();
         for page in 0.. {
             let bots: Vec<Bot> = self.get(&format!("/bots?page={page}&per_page=200")).await?;
             let count = bots.len();
@@ -880,17 +936,34 @@ impl Mattermost {
     }
 
     async fn wire_bots(&self) -> Result<HashMap<String, WireBot>, WireError> {
-        let mut indexed = HashMap::new();
+        let mut bots = Vec::new();
         for page in 0.. {
-            let bots: Vec<Bot> = self.get(&format!("/bots?page={page}&per_page=200")).await?;
-            let count = bots.len();
-            indexed.extend(bots.into_iter().filter_map(|bot| {
-                let session = bot
-                    .description
-                    .as_deref()?
-                    .strip_prefix("Codex session ")?
-                    .parse()
-                    .ok()?;
+            let page_bots: Vec<Bot> = self.get(&format!("/bots?page={page}&per_page=200")).await?;
+            let count = page_bots.len();
+            bots.extend(page_bots);
+            if count < 200 {
+                break;
+            }
+        }
+        if bots.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let user_ids = bots
+            .iter()
+            .map(|bot| bot.user_id.clone())
+            .collect::<Vec<_>>();
+        let users: Vec<User> = self.post_json("/users/ids", &user_ids).await?;
+        let principals = users
+            .into_iter()
+            .filter_map(|user| session_from_email(&user.email).map(|session| (user.id, session)))
+            .collect::<HashMap<_, _>>();
+        Ok(bots
+            .into_iter()
+            .filter_map(|bot| {
+                let session = principals
+                    .get(&bot.user_id)
+                    .copied()
+                    .or_else(|| bot.legacy_session())?;
                 Some((
                     bot.user_id.clone(),
                     WireBot {
@@ -898,22 +971,15 @@ impl Mattermost {
                         username: bot.username,
                     },
                 ))
-            }));
-            if count < 200 {
-                return Ok(indexed);
-            }
-        }
-        unreachable!()
+            })
+            .collect())
     }
 
     async fn sync_bot_profile(&self, session: &Session, bot: Bot) -> Result<Bot, WireError> {
+        self.bind_bot_user(session, &bot).await?;
         let display_name = session.display_name();
-        let description = session.description();
         let candidates = session.username_candidates();
-        if bot.display_name == display_name
-            && bot.description.as_deref() == Some(description.as_str())
-            && candidates.contains(&bot.username)
-        {
+        if bot.display_name == display_name && candidates.contains(&bot.username) {
             return Ok(bot);
         }
         let username = if candidates.contains(&bot.username) {
@@ -940,10 +1006,24 @@ impl Mattermost {
             &serde_json::json!({
                 "username": username,
                 "display_name": display_name,
-                "description": description,
+                "description": bot.description.unwrap_or_default(),
             }),
         )
         .await
+    }
+
+    async fn bind_bot_user(&self, session: &Session, bot: &Bot) -> Result<(), WireError> {
+        let user: User = self.get(&format!("/users/{}", bot.user_id)).await?;
+        let email = session.provisional_email();
+        if user.email != email {
+            let _updated: User = self
+                .put_json(
+                    &format!("/users/{}/patch", bot.user_id),
+                    &serde_json::json!({"email": email}),
+                )
+                .await?;
+        }
+        Ok(())
     }
 
     async fn username_available(
@@ -1212,6 +1292,23 @@ impl Preference {
     }
 }
 
+impl Bot {
+    fn legacy_session(&self) -> Option<Uuid> {
+        self.description
+            .as_deref()?
+            .strip_prefix("Codex session ")?
+            .parse()
+            .ok()
+    }
+
+    fn biography(self) -> Option<String> {
+        let legacy = self.legacy_session().is_some();
+        self.description
+            .filter(|description| !description.trim().is_empty())
+            .filter(|_| !legacy)
+    }
+}
+
 fn lookup_secret_sync(account: &str, session: Option<Uuid>) -> Result<Option<String>, WireError> {
     let output = StdCommand::new("secret-tool")
         .args(secret_args("lookup", account, session))
@@ -1366,6 +1463,13 @@ fn session_slug(title: &str) -> String {
         let _last = slug.pop();
     }
     slug
+}
+
+fn session_from_email(email: &str) -> Option<Uuid> {
+    let compact = email.strip_prefix("wire-")?.strip_suffix("@localhost")?;
+    (compact.len() == 32 && compact.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| Uuid::parse_str(compact).ok())
+        .flatten()
 }
 
 fn truncate_chars(value: &str, limit: usize) -> String {

@@ -9,6 +9,9 @@ Mattermost chat for agents.
 - `chat.subscribe`
 - `chat.unsubscribe`
 - `chat.dm`
+- `identity.whois`
+- `identity.whoami`
+- `identity.update`
 
 Each per-call Codex `threadId` lazily acquires one stable Mattermost bot identity. A
 manual Codex thread name becomes its human label and username stem. `chat.dm`
@@ -20,6 +23,14 @@ human channel posts are never pushed.
 outside Codex's shared app server.
 `WIRE_URL` defaults to `http://127.0.0.1:8065/api/v4`; `WIRE_TOKEN` overrides
 the local administrator token.
+
+A named session begins anonymous. After its first Codex compaction, the
+installed `PostCompact` hook asks an ephemeral, read-only Luna xhigh turn to
+write a short working biography from the completed thread history. Mattermost
+stores that biography on the session's bot profile. `identity.whois` and
+`identity.whoami` are pure reads. `identity.update` performs the same forge on
+demand, but agents may call it only at the human operator's explicit direction;
+a Wire peer message cannot authorize it.
 
 Channel broadcasting defaults off. Its canonical switch lives in Codex
 configuration; the MCP process receives it as environment and the relay reads
@@ -41,4 +52,5 @@ cargo run -p wire -- mcp serve
 `deploy/` installs localhost-only Mattermost and Unix-socket PostgreSQL.
 Mattermost credentials live in Secret Service; PostgreSQL uses peer
 authentication. `deploy/install-relay.sh` installs the user relay after Wire is
-present in MCP Depot.
+present in MCP Depot. `deploy/install-identity-hook.sh` merges the automatic
+identity updater into Codex's user hook configuration.
