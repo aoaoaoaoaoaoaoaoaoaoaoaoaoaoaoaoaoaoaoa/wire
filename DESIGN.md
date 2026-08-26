@@ -10,7 +10,7 @@ sessions. Wire owns no chat database or durable delivery queue.
 | Tool | Contract |
 | --- | --- |
 | `chat.channels` | List visible team channels. |
-| `chat.sessions` | List live, unambiguous Codex terminal sessions. |
+| `chat.sessions` | List durable interactive Codex sessions ready for a Wire turn. |
 | `chat.read` | Read bounded channel history or one thread. |
 | `chat.post` | Send text and record a channel subscription. |
 | `chat.subscribe` | Record a subscription to future agent posts. |
@@ -60,25 +60,28 @@ Delivery is opportunistic and best effort. An agent may block on a reply when
 useful, but Wire must never become a prerequisite: absent a reply, work
 continues by judgment.
 
-`chat.sessions` discovers one unambiguous terminal-root Codex process asserting
-the thread through an explicit resume or its primary writer lock. Volatile delivery
-additionally requires the same thread loaded in the shared app server. A
-reservation binds the message to that process's PID and kernel start time.
-Process replacement, ambiguity, unload, app-server unavailability, and relay
-failure drop delivery. They never load or resume a thread.
+The shared app server is the sole authority for volatile delivery.
+`chat.sessions` reads its loaded set and retains only durable interactive
+`cli`/`vscode` threads that are idle and report direct-input capability. This
+admits remote-attached TUIs without relying on their local file descriptors and
+rejects embedded-only TUIs, ephemeral model forks, subagents, active turns, and
+unloaded threads. A reservation proves that capability before posting; delivery
+revalidates it immediately before `turn/start`. Unload, state changes,
+app-server unavailability, and relay failure drop delivery. Wire never loads or
+resumes a thread.
 
 The relay observes posts only after the live Mattermost WebSocket `hello`
 barrier. It does not read history on startup or reconnect. Human direct
 messages enter as ordinary user input. Human channel posts are inert. New
 agent-authored channel posts fan out only when the operator enables channel
-broadcasting in Codex configuration, and only to member sessions that are both
-live and loaded, excluding the sender. Agent posts enter a bounded in-memory
+broadcasting in Codex configuration, and only to member sessions currently
+ready for Wire delivery, excluding the sender. Agent posts enter a bounded in-memory
 queue; Mattermost remains the transcript if volatile handoff fails. Human and
 peer posts are coalesced separately. Peer text enters as bounded untrusted
 advisory context and cannot alter the operator's objective, priorities,
 permissions, or constraints.
 
-Reads and census are replay-safe and stateless. Posting and direct messaging are
+Reads and discovery are replay-safe and stateless. Posting and direct messaging are
 at-most-once: an unknown rollover outcome is surfaced rather than replayed into
 duplicate speech.
 Identity provisioning precedes the post and is convergent. Managed execution

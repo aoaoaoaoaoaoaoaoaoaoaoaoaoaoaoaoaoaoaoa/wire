@@ -1,11 +1,10 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, VecDeque},
     env,
     path::PathBuf,
     time::Duration,
 };
 
-use codex_census::{Census, ProcessKey, SessionId};
 use futures_util::{SinkExt as _, StreamExt as _};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -14,6 +13,7 @@ use tokio_tungstenite::{
     WebSocketStream, client_async,
     tungstenite::{Message, client::IntoClientRequest as _},
 };
+use uuid::Uuid;
 
 const HANDSHAKE_URL: &str = "ws://localhost/rpc";
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
@@ -31,10 +31,17 @@ pub(crate) struct HumanMessage {
 #[derive(Clone, Debug)]
 pub(crate) struct PeerMessage {
     pub(crate) post_id: String,
-    pub(crate) sender_session: SessionId,
+    pub(crate) sender_session: Uuid,
     pub(crate) sender: String,
     pub(crate) source: AdvisorySource,
     pub(crate) body: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DeliveryTarget {
+    pub(crate) id: Uuid,
+    pub(crate) name: Option<String>,
+    pub(crate) cwd: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -51,35 +58,43 @@ pub(crate) enum Injection {
 
 #[derive(Debug, Error)]
 pub(crate) enum AppServerError {
-    #[error("target Codex session is no longer live in the reserved process")]
-    SeatChanged,
-    #[error("target Codex session is not loaded by the shared app server")]
-    NotLoaded,
+    #[error("target Codex session cannot accept a Wire turn")]
+    Unavailable,
+    #[error("Codex app server rejected a request: {0}")]
+    Rejected(String),
     #[error("Codex app-server control failed: {0}")]
     Control(String),
 }
 
-pub(crate) async fn inject(
-    session: SessionId,
-    process: ProcessKey,
-    injection: Injection,
-) -> Result<(), AppServerError> {
-    require_seat(session, process)?;
+pub(crate) async fn inject(session: Uuid, injection: Injection) -> Result<(), AppServerError> {
     let mut client = connect().await?;
-    if !client.loaded_sessions().await?.contains(&session) {
-        return Err(AppServerError::NotLoaded);
+    if !client.accepts_delivery(session).await? {
+        return Err(AppServerError::Unavailable);
     }
-    require_seat(session, process)?;
     let params = turn_params(session, injection);
     let _accepted = client.request("turn/start", params).await?;
     Ok(())
 }
 
-pub(crate) async fn loaded_sessions() -> Result<BTreeSet<SessionId>, AppServerError> {
-    connect().await?.loaded_sessions().await
+pub(crate) async fn delivery_targets() -> Result<Vec<DeliveryTarget>, AppServerError> {
+    let mut client = connect().await?;
+    let sessions = client.loaded_sessions().await?;
+    let mut targets = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        match client.delivery_target(session).await {
+            Ok(Some(target)) => targets.push(target),
+            Ok(None) | Err(AppServerError::Rejected(_)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(targets)
 }
 
-pub(crate) async fn mcp_status(session: SessionId) -> Result<Value, AppServerError> {
+pub(crate) async fn accepts_delivery(session: Uuid) -> Result<bool, AppServerError> {
+    connect().await?.accepts_delivery(session).await
+}
+
+pub(crate) async fn mcp_status(session: Uuid) -> Result<Value, AppServerError> {
     connect()
         .await?
         .request(
@@ -90,7 +105,7 @@ pub(crate) async fn mcp_status(session: SessionId) -> Result<Value, AppServerErr
 }
 
 pub(crate) async fn forge_identity(
-    session: SessionId,
+    session: Uuid,
     prompt: &str,
     output_schema: Value,
 ) -> Result<String, AppServerError> {
@@ -165,7 +180,7 @@ pub(crate) async fn forge_identity(
     result
 }
 
-pub(crate) async fn handoff(session: SessionId, message: &str) -> Result<(), AppServerError> {
+pub(crate) async fn handoff(session: Uuid, message: &str) -> Result<(), AppServerError> {
     let mut client = connect().await?;
     timeout(HANDOFF_TIMEOUT, async {
         loop {
@@ -256,19 +271,7 @@ async fn connect() -> Result<Client, AppServerError> {
     Ok(client)
 }
 
-fn require_seat(session: SessionId, process: ProcessKey) -> Result<(), AppServerError> {
-    let census = Census::scan().map_err(control)?;
-    if census
-        .seat(&session)
-        .is_some_and(|seat| seat.process == process)
-    {
-        Ok(())
-    } else {
-        Err(AppServerError::SeatChanged)
-    }
-}
-
-fn turn_params(session: SessionId, injection: Injection) -> Value {
+fn turn_params(session: Uuid, injection: Injection) -> Value {
     match injection {
         Injection::Human(messages) => {
             let client_id = messages.last().map(|message| message.post_id.clone());
@@ -370,7 +373,7 @@ struct Client {
 }
 
 impl Client {
-    async fn loaded_sessions(&mut self) -> Result<BTreeSet<SessionId>, AppServerError> {
+    async fn loaded_sessions(&mut self) -> Result<Vec<Uuid>, AppServerError> {
         let loaded = self.request("thread/loaded/list", json!({})).await?;
         Ok(loaded
             .get("data")
@@ -378,13 +381,34 @@ impl Client {
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
-            .filter_map(|id| SessionId::parse_str(id).ok())
+            .filter_map(|id| Uuid::parse_str(id).ok())
             .collect())
+    }
+
+    async fn delivery_target(
+        &mut self,
+        session: Uuid,
+    ) -> Result<Option<DeliveryTarget>, AppServerError> {
+        let response = self
+            .request("thread/read", json!({"threadId": session}))
+            .await?;
+        Ok(parse_delivery_target(&response).filter(|target| target.id == session))
+    }
+
+    async fn accepts_delivery(&mut self, session: Uuid) -> Result<bool, AppServerError> {
+        if !self.loaded_sessions().await?.contains(&session) {
+            return Ok(false);
+        }
+        match self.delivery_target(session).await {
+            Ok(target) => Ok(target.is_some()),
+            Err(AppServerError::Rejected(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     async fn wait_for_tool(
         &mut self,
-        session: SessionId,
+        session: Uuid,
         server: &str,
         version: &str,
         tool: &str,
@@ -446,7 +470,7 @@ impl Client {
                     let error = message
                         .get("error")
                         .map_or_else(|| message.to_string(), Value::to_string);
-                    return Err(AppServerError::Control(error));
+                    return Err(AppServerError::Rejected(error));
                 }
                 Message::Ping(payload) => self
                     .stream
@@ -534,6 +558,28 @@ impl Client {
             "connection ended before identity completion".to_owned(),
         ))
     }
+}
+
+fn parse_delivery_target(response: &Value) -> Option<DeliveryTarget> {
+    let thread = response.get("thread")?;
+    if thread.get("ephemeral")?.as_bool()?
+        || !matches!(thread.get("source")?.as_str()?, "cli" | "vscode")
+        || thread.pointer("/status/type")?.as_str()? != "idle"
+        || !thread.get("canAcceptDirectInput")?.as_bool()?
+    {
+        return None;
+    }
+    Some(DeliveryTarget {
+        id: Uuid::parse_str(thread.get("id")?.as_str()?).ok()?,
+        name: thread
+            .get("name")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        cwd: thread
+            .get("cwd")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+    })
 }
 
 fn required_string(value: &Value, pointer: &str, label: &str) -> Result<String, AppServerError> {

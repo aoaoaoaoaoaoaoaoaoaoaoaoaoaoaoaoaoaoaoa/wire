@@ -10,7 +10,6 @@ use std::{
     time::Duration,
 };
 
-use codex_census::{Census, ProcessKey, SessionId};
 use futures_util::{SinkExt as _, StreamExt as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -29,6 +28,7 @@ use tokio_tungstenite::{
         http::{HeaderValue, header::AUTHORIZATION},
     },
 };
+use uuid::Uuid;
 
 use crate::{
     api::{Mattermost, Post, WireError},
@@ -56,38 +56,16 @@ pub(crate) enum RelayError {
     Mattermost(#[from] WireError),
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-struct SeatToken {
-    pid: u32,
-    start_ticks: u64,
-}
-
-impl From<ProcessKey> for SeatToken {
-    fn from(process: ProcessKey) -> Self {
-        Self {
-            pid: process.pid,
-            start_ticks: process.start_ticks(),
-        }
-    }
-}
-
-impl From<SeatToken> for ProcessKey {
-    fn from(seat: SeatToken) -> Self {
-        Self::from_parts(seat.pid, seat.start_ticks)
-    }
-}
-
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum LocalRequest {
     Reserve {
-        target: SessionId,
+        target: Uuid,
     },
     Enqueue {
-        target: SessionId,
-        seat: SeatToken,
+        target: Uuid,
         post_id: String,
-        sender_session: SessionId,
+        sender_session: Uuid,
         sender: String,
         body: String,
     },
@@ -96,19 +74,18 @@ enum LocalRequest {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum LocalResponse {
-    Ready { seat: SeatToken },
+    Ready,
     Queued,
     Error { message: String },
 }
 
 pub(crate) struct Reservation {
-    target: SessionId,
-    seat: SeatToken,
+    target: Uuid,
     stream: BufStream<UnixStream>,
 }
 
 impl Reservation {
-    pub(crate) async fn open(target: SessionId) -> Result<Self, RelayError> {
+    pub(crate) async fn open(target: Uuid) -> Result<Self, RelayError> {
         let stream = timeout(LOCAL_TIMEOUT, UnixStream::connect(socket_path()?))
             .await
             .map_err(|_| RelayError::Protocol("relay connection timed out".to_owned()))??;
@@ -118,11 +95,7 @@ impl Reservation {
             .await
             .map_err(|_| RelayError::Protocol("relay preflight timed out".to_owned()))??;
         match response {
-            LocalResponse::Ready { seat } => Ok(Self {
-                target,
-                seat,
-                stream,
-            }),
+            LocalResponse::Ready => Ok(Self { target, stream }),
             LocalResponse::Error { message } => Err(RelayError::Protocol(message)),
             LocalResponse::Queued => Err(RelayError::Protocol(
                 "relay returned an impossible preflight response".to_owned(),
@@ -133,7 +106,7 @@ impl Reservation {
     pub(crate) async fn enqueue(
         mut self,
         post_id: String,
-        sender_session: SessionId,
+        sender_session: Uuid,
         sender: String,
         body: String,
     ) -> Result<(), RelayError> {
@@ -141,7 +114,6 @@ impl Reservation {
             &mut self.stream,
             &LocalRequest::Enqueue {
                 target: self.target,
-                seat: self.seat,
                 post_id,
                 sender_session,
                 sender,
@@ -158,7 +130,7 @@ impl Reservation {
         match response {
             LocalResponse::Queued => Ok(()),
             LocalResponse::Error { message } => Err(RelayError::Protocol(message)),
-            LocalResponse::Ready { .. } => Err(RelayError::Protocol(
+            LocalResponse::Ready => Err(RelayError::Protocol(
                 "relay returned an impossible enqueue response".to_owned(),
             )),
         }
@@ -179,8 +151,7 @@ enum Payload {
 
 #[derive(Clone, Debug)]
 struct Delivery {
-    target: SessionId,
-    process: ProcessKey,
+    target: Uuid,
     payload: Payload,
 }
 
@@ -193,7 +164,7 @@ impl Delivery {
     }
 
     fn shares_batch(&self, other: &Self) -> bool {
-        self.target == other.target && self.process == other.process && self.kind() == other.kind()
+        self.target == other.target && self.kind() == other.kind()
     }
 }
 
@@ -242,17 +213,11 @@ async fn handle_local(
             return write_protocol_error(&mut stream, "reservation required").await;
         }
     };
-    let Some(process) = live_process(target)? else {
-        return write_protocol_error(&mut stream, "that Codex session is not live").await;
-    };
-    match appserver::loaded_sessions().await {
-        Ok(sessions) if sessions.contains(&target) => {}
-        Ok(_) => {
-            return write_protocol_error(
-                &mut stream,
-                "that Codex session is not attached to the shared app server",
-            )
-            .await;
+    match appserver::accepts_delivery(target).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return write_protocol_error(&mut stream, "that Codex session is not ready for Wire")
+                .await;
         }
         Err(error) => {
             return write_protocol_error(
@@ -262,8 +227,7 @@ async fn handle_local(
             .await;
         }
     }
-    let seat = SeatToken::from(process);
-    write_frame(&mut stream, &LocalResponse::Ready { seat }).await?;
+    write_frame(&mut stream, &LocalResponse::Ready).await?;
     let request = timeout(
         RESERVATION_TIMEOUT,
         read_frame::<LocalRequest, _>(&mut stream),
@@ -272,7 +236,6 @@ async fn handle_local(
     .map_err(|_| RelayError::Protocol("reservation expired".to_owned()))??;
     let LocalRequest::Enqueue {
         target: submitted_target,
-        seat: submitted_seat,
         post_id,
         sender_session,
         sender,
@@ -281,16 +244,12 @@ async fn handle_local(
     else {
         return write_protocol_error(&mut stream, "reservation already exists").await;
     };
-    if submitted_target != target || submitted_seat != seat {
+    if submitted_target != target {
         return write_protocol_error(&mut stream, "reservation identity changed").await;
-    }
-    if live_process(target)? != Some(process) {
-        return write_protocol_error(&mut stream, "target Codex process changed").await;
     }
     deliveries
         .send(Delivery {
             target,
-            process,
             payload: Payload::Peer(PeerMessage {
                 post_id,
                 sender_session,
@@ -391,15 +350,11 @@ async fn admit_event(
     let Some(audience) = api.channel_audience(&post).await? else {
         return Ok(());
     };
-    let loaded = match appserver::loaded_sessions().await {
-        Ok(loaded) => loaded,
-        Err(error) => {
-            eprintln!("wire relay: dropped channel post {}: {error}", post.id);
-            return Ok(());
-        }
-    };
-    let census = match Census::scan() {
-        Ok(census) => census,
+    let targets = match appserver::delivery_targets().await {
+        Ok(targets) => targets
+            .into_iter()
+            .map(|target| target.id)
+            .collect::<HashSet<_>>(),
         Err(error) => {
             eprintln!("wire relay: dropped channel post {}: {error}", post.id);
             return Ok(());
@@ -410,15 +365,11 @@ async fn admit_event(
         audience.channel.team.name, audience.channel.channel.display_name
     );
     for recipient in audience.recipients {
-        if !loaded.contains(&recipient.session) {
+        if !targets.contains(&recipient.session) {
             continue;
         }
-        let Some(seat) = census.seat(&recipient.session) else {
-            continue;
-        };
         let delivery = Delivery {
             target: recipient.session,
-            process: seat.process,
             payload: Payload::Peer(PeerMessage {
                 post_id: post.id.clone(),
                 sender_session: audience.sender.session,
@@ -449,13 +400,17 @@ async fn admit_human_post(
         // Human posts in ordinary channels are deliberately inert.
         return Ok(());
     };
-    let Some(process) = live_process(target)? else {
-        return Ok(());
-    };
+    match appserver::accepts_delivery(target).await {
+        Ok(true) => {}
+        Ok(false) => return Ok(()),
+        Err(error) => {
+            eprintln!("wire relay: dropped human delivery to {target}: {error}");
+            return Ok(());
+        }
+    }
     let _accepted = deliveries
         .send(Delivery {
             target,
-            process,
             payload: Payload::Human(HumanMessage {
                 post_id: post.id,
                 body: post.message,
@@ -516,7 +471,6 @@ impl SeenPosts {
 
 async fn deliver(batch: Vec<Delivery>) {
     let target = batch[0].target;
-    let process = batch[0].process;
     let injection = match batch[0].kind() {
         Kind::Human => Injection::Human(
             batch
@@ -537,14 +491,9 @@ async fn deliver(batch: Vec<Delivery>) {
                 .collect(),
         ),
     };
-    if let Err(error) = appserver::inject(target, process, injection).await {
+    if let Err(error) = appserver::inject(target, injection).await {
         eprintln!("wire relay: dropped delivery to {target}: {error}");
     }
-}
-
-fn live_process(target: SessionId) -> Result<Option<ProcessKey>, RelayError> {
-    let census = Census::scan().map_err(|error| RelayError::Protocol(error.to_string()))?;
-    Ok(census.seat(&target).map(|seat| seat.process))
 }
 
 fn bind_socket() -> Result<(UnixListener, SocketGuard), RelayError> {

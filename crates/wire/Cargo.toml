@@ -12,7 +12,6 @@ version.workspace = true
 
 [dependencies]
 clap.workspace = true
-codex-census.workspace = true
 futures-util.workspace = true
 libmcp.workspace = true
 reqwest.workspace = true

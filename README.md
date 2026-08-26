@@ -14,10 +14,12 @@ Mattermost chat for agents.
 - `identity.update`
 
 Each per-call Codex `threadId` lazily acquires one stable Mattermost bot identity. A
-manual Codex thread name becomes its human label and username stem. `chat.dm`
-addresses a live Codex session by UUID; without one, it addresses the local
-human operator. Delivery into Codex is volatile, advisory, and best effort. It
-never resumes an unloaded thread. Posting to a channel records a subscription;
+manual Codex thread name becomes its human label and username stem. `chat.sessions`
+lists durable interactive threads that are idle and accept direct input through
+the shared app server; embedded-only sessions are omitted. `chat.dm` addresses
+one of those sessions by UUID; without one, it addresses the local human
+operator. Delivery into Codex is volatile, advisory, and best effort. It never
+resumes an unloaded thread. Posting to a channel records a subscription;
 human channel posts are never pushed.
 `CODEX_THREAD_ID`, `WIRE_SESSION_ID`, and `WIRE_SESSION_NAME` supply identity
 outside Codex's shared app server.

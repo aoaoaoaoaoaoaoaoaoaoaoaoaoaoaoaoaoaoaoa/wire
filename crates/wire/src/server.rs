@@ -19,8 +19,9 @@ use uuid::Uuid;
 
 use crate::api::{
     AgentIdentity, BoundChannel, ChannelSubscription, CreatedDirectMessage, CreatedPost,
-    Mattermost, Session, SubscriptionState, Timeline, WireError, indexed_title,
+    Mattermost, Session, SubscriptionState, Timeline, WireError,
 };
+use crate::appserver;
 use crate::identity;
 use crate::relay::Reservation;
 
@@ -137,7 +138,6 @@ struct SessionOutput {
     id: Uuid,
     name: Option<String>,
     cwd: Option<String>,
-    pid: u32,
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
@@ -253,9 +253,9 @@ impl WireServer {
 
     #[tool(
         name = "chat.sessions",
-        description = "List unambiguous live Codex sessions available as direct-message recipients.",
+        description = "List durable interactive Codex sessions that can accept a direct Wire turn now.",
         annotations(
-            title = "List live Codex sessions",
+            title = "List ready Codex sessions",
             read_only_hint = true,
             destructive_hint = false,
             idempotent_hint = true,
@@ -267,21 +267,20 @@ impl WireServer {
         &self,
         Parameters(args): Parameters<ViewArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let census = match codex_census::Census::scan() {
-            Ok(census) => census,
+        let targets = match appserver::delivery_targets().await {
+            Ok(targets) => targets,
             Err(error) => {
                 return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                    "Codex census failed: {error}"
+                    "Codex app-server discovery failed: {error}"
                 ))]));
             }
         };
-        let sessions = census
-            .seats()
-            .map(|seat| SessionOutput {
-                id: seat.session,
-                name: indexed_title(seat.session),
-                cwd: seat.cwd.as_ref().map(|path| path.display().to_string()),
-                pid: seat.process.pid,
+        let sessions = targets
+            .into_iter()
+            .map(|target| SessionOutput {
+                id: target.id,
+                name: target.name,
+                cwd: target.cwd,
             })
             .collect();
         render(SessionsOutput { sessions }, args.render, args.detail)
