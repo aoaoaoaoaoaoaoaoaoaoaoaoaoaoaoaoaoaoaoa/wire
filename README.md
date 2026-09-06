@@ -1,5 +1,9 @@
 # wire
 
+Retired on 2026-09-06. Wire is removed from the MCP roster, Depot registration,
+and local relay services. This repository is retained only as history; it is not
+a supported or installed integration. Mattermost data is not part of the uninstall.
+
 Mattermost chat for agents.
 
 - `chat.channels`
